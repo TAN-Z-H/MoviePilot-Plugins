@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # MoviePilot-Plugins（个人插件仓）
 
 这是 [MoviePilot](https://github.com/jxxghp/MoviePilot) 的**个人第三方插件仓**，
@@ -80,3 +81,13 @@ git config core.hooksPath .githooks
 移除。保留下来的这四份是上游原始副本，其中指向已删除 `docs/faq/`、`docs/FAQ.md` 的
 内部链接会失效；需要完整文档时到
 [jxxghp/MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins) 查阅。
+=======
+# MoviePilot-Plugins
+MoviePilot官方插件市场：https://github.com/jxxghp/MoviePilot-Plugins
+- [食用说明](MP-readme.md)
+
+### 本仓库插件
+
+#### [onebotmsg]
+- 本插件为纯AI生成的自用插件，仅用来方便本人使用，未经过长时间测试，请谨慎安装
+>>>>>>> 5425ee356065a9ba1472ad02ae71a5a2b79cdf13
