@@ -12,10 +12,10 @@
 
     <workspace>/.venv/bin/python -m pytest tests/v3/onebotmsg   # 仓库门禁
     <workspace>/.venv/bin/python tests/run.py                   # 全量回归
-    python tests/v3/onebotmsg/test_plugin.py                    # 无宿主时的 stub 自检
 
-缺少 MoviePilot 后端时（例如仅装了标准库的开发机），测试自动降级为内置 stub 自检，
-保证纯逻辑仍可验证；正式提交与 CI 必须走真实宿主。
+本文件只提供 pytest 用例，不提供独立执行入口（仓库测试约定）。缺少 MoviePilot 后端时
+（例如仅装了标准库的开发机），导入生产命名空间会失败并自动降级为内置 stub 自检，
+保证纯逻辑仍可验证；提交与 CI 必须走真实宿主。
 
 真实 V3 宿主的加载验证（插件安装、启停、重载、命令与 API 注册、QQ 实发）不属于
 本文件的职责，必须在真实 MoviePilot V3 环境中单独完成。
@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import inspect
 import json
 import sys
@@ -31,6 +32,20 @@ import types
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from unittest import mock
+
+
+def _require_pytest():
+    """按仓库约定取得 pytest，缺失时跳过而不是让模块导入失败。
+
+    正式门禁由 ``tests/run.py`` 或 ``-m pytest`` 执行，pytest 必然存在；这里做惰性
+    解析是为了让本文件在缺少 pytest 的裸解释器下仍能被导入，从而复用同一份回归逻辑
+    做手动排查。
+    """
+    if importlib.util.find_spec("pytest") is None:
+        return None
+    import pytest as pytest_module
+
+    return pytest_module
 
 # Windows 控制台默认使用 GBK，直接打印 emoji 会抛 UnicodeEncodeError。
 for _stream_name in ("stdout", "stderr"):
@@ -1072,20 +1087,6 @@ def run_all_checks() -> List[Tuple[str, str]]:
     return failures()
 
 
-def main() -> int:
-    """独立运行入口：打印逐项结果并返回退出码。"""
-    failed = run_all_checks()
-    passed = len(CHECKS) - len(failed)
-    _safe_print("\n" + "=" * 64)
-    if failed:
-        _safe_print(f"结果：{passed}/{len(CHECKS)} 通过，{len(failed)} 项失败")
-        for group_name, name in failed:
-            _safe_print(f"  - [{group_name}] {name}")
-        return 1
-    _safe_print(f"结果：全部 {len(CHECKS)} 项检查通过")
-    return 0
-
-
 # ------------------------------------------------------------ pytest 入口
 
 
@@ -1096,12 +1097,16 @@ def test_onebotmsg_regression() -> None:
     收集用例前完成 v3 引导（隔离 CONFIG_DIR、建表、把 ``plugins.v3/`` 注入
     ``app.plugins.__path__``），autouse 的 ``configure_plugin_chain_context`` 负责装配
     插件基类构造所需的 Chain 上下文。
+
+    以惰性解析的 pytest 守卫开头，使本文件在缺少 pytest 的裸解释器下跳过而不是报错；
+    正式门禁始终通过 ``tests/run.py`` 或 ``-m pytest`` 执行。
     """
+    pytest_module = _require_pytest()
+    if pytest_module is None:
+        import unittest
+
+        raise unittest.SkipTest("未安装 pytest，跳过插件回归")
     failed = run_all_checks()
     detail = "; ".join(f"[{group_name}] {name}" for group_name, name in failed)
     assert not failed, f"{len(failed)} 项检查失败：{detail}"
     assert CHECKS, "未执行任何检查"
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

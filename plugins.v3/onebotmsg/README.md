@@ -9,6 +9,7 @@
 - 测试目录：`tests/v3/onebotmsg/`
 - 版本：`1.0.0`，要求 `MoviePilot >= 3.0.0`
 - 依赖：无（仅使用 Python 标准库与宿主已提供的 pydantic / fastapi）
+- 图标：使用 NapCat 官方 Logo 外链，仓库不附带图标文件（版权归 NapCat 项目所有）
 
 ---
 
@@ -250,13 +251,11 @@ userid, username, targets, buttons, ...
 
 # 只跑本插件
 <workspace>/.venv/bin/python -m pytest tests/v3/onebotmsg
-
-# 无宿主环境下的独立运行（自动降级为轻量 stub，仅用于本机快速回归）
-python tests/v3/onebotmsg/test_plugin.py
 ```
 
 > 缺少 MoviePilot 后端时，测试会降级为内置 stub 自检；**正式提交与 CI 必须走
-> 真实宿主**。测试不会把插件目录加入 `sys.path`，避免同一源码被双重导入。
+> 真实宿主**。测试不会把插件目录加入 `sys.path`，避免同一源码被双重导入；
+> 按仓库约定只提供 pytest 用例，不提供独立的 `__main__` 入口。
 
 在真实 MoviePilot V3 宿主中安装后，还需确认插件能正常加载、启用、禁用与重载，
 `DEBUG=true` 时不产生旧导入路径告警，并在页面上点「发送测试通知」验证 QQ 可达。

@@ -1,97 +1,82 @@
-# MoviePilot-Plugins
+# MoviePilot-Plugins（个人插件仓）
 
-MoviePilot 官方插件仓库，也是默认插件市场的源码与索引仓库：
-<https://github.com/jxxghp/MoviePilot-Plugins>
+这是 [MoviePilot](https://github.com/jxxghp/MoviePilot) 的**个人第三方插件仓**，
+只维护一个 V3 插件。通过 `PLUGIN_MARKET` 指向本仓地址即可让 MoviePilot 从本仓安装。
 
-当前开发目标是 MoviePilot V3。新插件开发者不需要先阅读 V2 文档，也不要在多份
-“适配指南”之间自行拼接流程。
+- 仓库地址：`https://github.com/TAN-Z-H/MoviePilot-Plugins`
+- 上游仓库：[jxxghp/MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins)（fork 来源）
 
-## 从这里开始
+## 插件清单
 
-### 开发一个新的 V3 插件
+| 插件 ID | 名称 | 版本 | 说明 |
+| --- | --- | --- | --- |
+| `OneBotMsg` | OneBot v11 通知 | 1.0.0 | 通过 OneBot v11（NapCat）向 QQ 私聊/群聊推送 MoviePilot 通知：入库整理、下载、订阅、站点、媒体服务器、插件与系统错误等场景 |
 
-阅读 [MoviePilot 插件开发指南（V3）](./docs/Plugin_Development.md)。这是当前唯一的
-完整主指南，覆盖目录、最小骨架、生命周期、稳定 SDK、配置与数据、V3 数据库事务、
-页面、事件、API、服务、测试和发布。
+详见 [plugins.v3/onebotmsg/README.md](./plugins.v3/onebotmsg/README.md)：NapCat 侧的
+HTTP 服务器与 Token 配置、插件配置项、目标格式、远程命令、插件 API 与排查方法。
 
-### 把旧插件迁移到 V3
+## 目录结构
 
-先阅读主指南，再查看
-[V2 插件迁移到 V3](./docs/V3_Plugin_Adaptation.md)。迁移专题只讲旧导入兼容、
-数据库事务、媒体身份、音乐链、数据迁移和 V3 合同差异，不再承担从零开发说明。
-
-### 维护官方仓库或发布版本
-
-查看 [仓库与发布指南](./docs/Repository_Guide.md)，了解索引、版本选择、元数据、
-CI、Release 和跨仓协作边界。
-
-### 按具体功能查示例
-
-查看 [常见问题](./docs/FAQ.md)。API 返回与前端调用另见
-[插件 API 专题](./docs/V3_API_Response_Adaptation.md)。
-
-### 仍然维护 V2 插件
-
-[V2 插件开发指南](./docs/V2_Plugin_Development.md) 仅作为历史版本参考。新插件和
-V3 专用实现不要从该文档开始。
-
-## 仓库负责什么
-
-本仓库不是独立运行时：
-
-- `MoviePilot` 负责插件加载、事件分发、API、服务、数据、工作流和 Agent 运行时。
-- `MoviePilot-Frontend` 负责配置页、详情页、仪表板和 Vue 联邦组件渲染。
-- `MoviePilot-Plugins` 负责插件源码、市场索引、图标、测试、文档和发布流程。
-
-## 当前目录
-
-```text
+```
 MoviePilot-Plugins/
-├── plugins.v3/              # 当前 V3 专用插件，新插件放这里
-├── tests/v3/                # V3 插件测试
-├── package.v3.json          # V3 插件市场索引
-├── plugins.v2/              # V2 历史专用实现
-├── package.v2.json          # V2 历史索引
-├── plugins/                 # 更早或跨版本的存量实现
-├── package.json             # 默认历史索引
-├── icons/                   # 插件图标
-├── docs/                    # 开发、迁移、FAQ 和发布文档
-└── .github/                 # CI 与 Release 工作流
+├── plugins.v3/onebotmsg/
+│   ├── __init__.py        # 插件主类 OneBotMsg
+│   ├── onebot.py          # OneBot v11 客户端（纯标准库）
+│   ├── pyproject.toml     # 依赖清单（无额外依赖）
+│   └── README.md          # 插件使用文档
+├── tests/
+│   ├── v3/onebotmsg/test_plugin.py   # 插件回归测试
+│   ├── _bootstrap.py、conftest.py、run.py   # 测试引导与入口
+│   └── README.md          # 测试约定
+├── package.v3.json        # V3 插件市场索引
+├── package.v2.json        # 历史代索引（本仓为空对象）
+├── package.json           # 默认历史索引（本仓为空对象）
+├── scripts/               # 上游新增插件 / 依赖 / 导入边界检查工具
+├── docs/                  # 上游 V3 插件开发与仓库规范文档
+├── .githooks/pre-push     # push 前的版本与 CSS 校验
+└── .github/
+    ├── scripts/           # 版本与联邦 CSS 校验器
+    └── workflows/         # release（发布）、plugin-gate（PR 门禁）、sync-upstream（同步上游）
 ```
 
-V3 新插件使用 `plugins.v3/<plugin_id_lower>/`、`tests/v3/<plugin_id_lower>/` 和
-`package.v3.json`。V3 对旧插件的回退加载只用于兼容存量实现，不是新插件继续写入
-旧目录的理由。
+## 发布方式
 
-## 最重要的提交规则
+推送 `package*.json` 变更到 `main` 会触发 `.github/workflows/release.yml`：
 
-- 插件目录名必须是插件主类名的小写形式，主类定义在目录的 `__init__.py`。
-- 新增类和方法需要补充说明职责的注释。
-- `plugin_version`、索引 `version` 和最新 `history` 必须一致。
-- 当前版本历史置顶，所有历史按语义版本降序排列。
-- V3 新代码优先使用 `app.sdk`；不要新增对宿主内部目录布局的无必要依赖。
-- 宿主数据通过 Oper、Chain 或稳定 SDK 访问；不要直接操作宿主 Model，也不要自行持有
-  `SessionFactory` 等裸会话工厂。数据库事务装饰器只用于插件自有表。
-- 插件运行数据写入插件数据目录，不要写回源码目录。
-- V3 第三方依赖写入插件 `pyproject.toml`，不提交插件 `uv.lock`；V1/V2 保留 `requirements.txt`。
-- 第三方依赖安装在宿主共享环境，不能降级或覆盖 MoviePilot 核心依赖，也不要由插件直接执行包管理器。
-- 测试放在仓库根 `tests/v3/<plugin_id>/`，不要放进插件源码目录。
-- 提交前运行 Python 编译、版本门禁、相关测试和 `git diff --check`。
+1. 校验索引版本与插件类版本一致（`check_plugin_versions.py`）；
+2. 对索引中声明 `"release": true` 的插件，按 `插件ID_v版本号` 打 tag；
+3. 打包插件目录为 `插件目录小写_v版本号.zip` 并创建 GitHub Release。
 
-## 第三方插件仓库
+因此发布新版本时需要同步三处：`package.v3.json` 的 `version`、插件类的
+`plugin_version`、`history` 顶部的当前版本说明。
 
-第三方仓库建议 fork 本项目并保留相同目录和索引结构。MoviePilot 插件市场只读取
-GitHub 仓库的 `main` 分支；仓库地址通过 `PLUGIN_MARKET` 配置，多个地址用逗号
-分隔。
+## 提交前自检
 
-请勿开发用于破解 MoviePilot 用户认证，或提供色情、赌博等违法违规内容的插件。
+```bash
+python .github/scripts/check_plugin_versions.py package.json package.v2.json package.v3.json
+python .github/scripts/check_federation_css.py
+python -m compileall plugins.v3/onebotmsg
 
-## 常用链接
+# 需要 MoviePilot 后端（同级目录或 MOVIEPILOT_BACKEND_PATH 指向）
+<workspace>/.venv/bin/python tests/run.py
+```
 
-- [完整 V3 开发指南](./docs/Plugin_Development.md)
-- [V2 插件迁移到 V3](./docs/V3_Plugin_Adaptation.md)
-- [插件 API 专题](./docs/V3_API_Response_Adaptation.md)
+`.githooks/pre-push` 已复用上述版本与 CSS 校验；启用方式：
+
+```bash
+git config core.hooksPath .githooks
+```
+
+## 文档
+
+本仓保留上游 V3 插件开发规范，便于后续维护与新增插件：
+
+- [插件开发指南（V3）](./docs/Plugin_Development.md)
 - [仓库与发布指南](./docs/Repository_Guide.md)
-- [FAQ 索引](./docs/FAQ.md)
-- [插件仓测试说明](./tests/README.md)
-- [MoviePilot-Frontend V3 模块联邦指南](https://github.com/jxxghp/MoviePilot-Frontend/blob/v3/docs/module-federation-guide.md)
+- [插件 API 响应适配](./docs/V3_API_Response_Adaptation.md)
+- [V2 插件迁移到 V3](./docs/V3_Plugin_Adaptation.md)
+
+上游仓库的其它文档（FAQ 索引、功能专题 `docs/faq/`、V1/V2 历史指南）已随无关内容一并
+移除。保留下来的这四份是上游原始副本，其中指向已删除 `docs/faq/`、`docs/FAQ.md` 的
+内部链接会失效；需要完整文档时到
+[jxxghp/MoviePilot-Plugins](https://github.com/jxxghp/MoviePilot-Plugins) 查阅。
