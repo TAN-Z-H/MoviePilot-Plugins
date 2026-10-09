@@ -1,0 +1,7 @@
+[project]
+name = "moviepilot-plugin-onebotmsg"
+dynamic = ["version"]
+requires-python = ">=3.10"
+# 本插件只使用 Python 标准库（urllib/queue/threading）与宿主已提供的
+# pydantic、fastapi，因此不声明任何额外依赖，安装时不会触碰宿主依赖图。
+dependencies = []
