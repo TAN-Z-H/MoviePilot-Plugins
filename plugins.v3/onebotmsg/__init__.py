@@ -4,12 +4,15 @@
 
 1. 订阅宿主 ``EventType.NoticeMessage``，把 MoviePilot 全部通知（入库/整理、
    下载、订阅、站点、媒体服务器、插件、系统错误等）转发到 QQ；
-2. 订阅 ``TransferComplete`` / ``TransferFailed`` / ``SubscribeComplete`` 等事件，
-   在通知之外补充结构化上下文（分类、季集、文件数、来源站点等）；
-3. 通过 OneBot v11 正向 HTTP 接口（NapCat 默认端口 3000）下发私聊与群聊消息，
-   支持图片与链接，可选群内 @；
-4. 内置发送队列、限流、去重与重试，避免消息轰炸与 NapCat 风控；
-5. 提供远程命令与插件 API，便于在 QQ 里查询状态、在外部系统主动推送。
+2. 订阅 ``TransferComplete`` / ``TransferFailed`` 等事件，在通知之外补充结构化
+   上下文（分类、季集、文件数、体积、目标路径、失败原因等）；
+3. 支持两种 OneBot v11 传输：正向 HTTP 接口与正向 WebSocket 长连接
+   （见 :mod:`.transport`），并可通过 NapCat 扩展 API 发送合并转发、贴表情回复、
+   上传群文件（见 :mod:`.napcat`）；
+4. 通知文本按卡片样式排版，并按显示宽度对齐（见 :mod:`.render`）；
+5. 图片支持 URL / base64 / 本地路径多种落地方式，并带自动降级；
+6. 内置发送队列、限流、去重与重试，避免消息轰炸与 NapCat 风控；
+7. 提供远程命令与插件 API，便于在 QQ 里查询状态、在外部系统主动推送。
 
 宿主合同来自 MoviePilot V3：
 ``app.sdk.plugin._PluginBase``、``app.sdk.events``、``app.sdk.services``、
@@ -34,15 +37,47 @@ try:  # pragma: no cover - 兼容宿主未暴露该入口的早期 V3 版本
 except Exception:  # noqa: BLE001
     resolve_media_identity = None  # type: ignore[assignment]
 
+from .napcat import (
+    IMAGE_MODE_AUTO,
+    IMAGE_MODE_LABELS,
+    IMAGE_MODE_TEXT,
+    can_send_image,
+    forward_node,
+    normalize_image_candidates,
+    probe_extensions,
+    segments_text,
+    send_forward,
+    send_group_notice,
+    send_image,
+    set_reaction,
+    text_segment,
+)
 from .onebot import (
-    OneBotClient,
     OneBotResponse,
-    build_image_segment,
-    build_text_segment,
     parse_qq_targets,
     parse_user_target_map,
     shorten,
-    split_segments,
+)
+from .render import (
+    DEFAULT_MAX_WIDTH,
+    STYLE_CARD,
+    STYLE_COMPACT,
+    STYLE_LABELS,
+    STYLE_PLAIN,
+    build_card,
+    build_forward_nodes,
+    build_status_card,
+    build_test_card,
+    normalize_style,
+)
+from .transport import (
+    TRANSPORT_HTTP,
+    TRANSPORT_LABELS,
+    TRANSPORT_WS,
+    Transport,
+    build_transport,
+    describe_transport,
+    normalize_transport,
 )
 
 
@@ -71,6 +106,17 @@ _DEFAULT_MAX_LENGTH = 1200
 # 队列工作线程的轮询步长（秒），用于及时响应停止请求。
 _WORKER_IDLE_STEP = 0.5
 
+# 长通知超过该行数时，合并转发模式更合适（QQ 折叠展示，不刷屏）。
+_FORWARD_HINT_ROWS = 5
+
+# 发送方式
+SEND_MODE_TEXT = "text"
+SEND_MODE_FORWARD = "forward"
+SEND_MODE_LABELS = {
+    SEND_MODE_TEXT: "单条消息（卡片文本）",
+    SEND_MODE_FORWARD: "合并转发（NapCat 扩展，长通知更整洁）",
+}
+
 
 class PushResult(BaseModel):
     """手动推送接口的返回模型。"""
@@ -86,12 +132,12 @@ class OneBotMsg(_PluginBase):
     # 插件名称
     plugin_name = "OneBot v11 通知"
     # 插件描述
-    plugin_desc = "通过 OneBot v11（NapCat）向 QQ 私聊/群聊推送 MoviePilot 通知，支持入库、下载、订阅、站点、系统错误等场景。"
+    plugin_desc = "通过 OneBot v11（NapCat）向 QQ 私聊/群聊推送 MoviePilot 通知，支持 HTTP / WebSocket 两种传输与 NapCat 扩展 API。"
     # 插件图标：使用 NapCat 官方 Logo 的完整 HTTPS 地址。
     # 插件市场索引与插件类声明同一个字段，两者必须保持同一形式。
     plugin_icon = "https://raw.githubusercontent.com/NapNeko/NapCatQQ/main/logo.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "TANZZZ"
     # 作者主页
@@ -107,7 +153,8 @@ class OneBotMsg(_PluginBase):
 
     # 插件是否启用
     _enabled: bool = False
-    # OneBot 接口地址与鉴权
+    # 连接方式与地址、鉴权
+    _transport_kind: str = TRANSPORT_HTTP
     _api_url: str = ""
     _access_token: str = ""
     # 目标：私聊 QQ 号与群号
@@ -121,17 +168,24 @@ class OneBotMsg(_PluginBase):
     # 内容开关
     _msgtypes: List[str] = []
     _send_image: bool = True
+    _image_mode: str = IMAGE_MODE_AUTO
+    _max_image_mb: float = 3.0
     _send_link: bool = True
     _at_in_group: bool = False
     _title_prefix: str = ""
+    _style: str = STYLE_CARD
+    _send_mode: str = SEND_MODE_TEXT
+    _forward_threshold: int = _FORWARD_HINT_ROWS
+    _react_on_success: bool = False
     _max_length: int = _DEFAULT_MAX_LENGTH
+    _card_width: int = DEFAULT_MAX_WIDTH
     _dedupe_seconds: int = 20
     _rate_limit: float = 3.0
     # 失败重试次数
     _retries: int = 2
 
     # 运行期资源
-    _client: Optional[OneBotClient] = None
+    _transport: Optional[Transport] = None
     _queue: "queue.Queue[Dict[str, Any]]" = None  # type: ignore[assignment]
     _worker: Optional[threading.Thread] = None
     _stop_event: threading.Event = None  # type: ignore[assignment]
@@ -139,6 +193,10 @@ class OneBotMsg(_PluginBase):
     _accepting: bool = False
     # 运行统计
     _stats: Dict[str, int] = None  # type: ignore[assignment]
+    # 最近一次成功投递的消息 ID（用于贴表情回复等扩展动作）
+    _last_message_id: Optional[Union[str, int]] = None
+    # NapCat 能力探测结果（延迟查询，避免每次发送都请求）
+    _capabilities: Dict[str, Any] = None  # type: ignore[assignment]
 
     def __init__(self) -> None:
         """建立实例级生命周期状态，避免热重载复用旧的队列与线程引用。"""
@@ -152,6 +210,8 @@ class OneBotMsg(_PluginBase):
         self._lifecycle_lock = threading.Lock()
         self._worker = None
         self._accepting = False
+        self._last_message_id = None
+        self._capabilities = {}
         self._stats = {
             "received": 0,
             "sent": 0,
@@ -159,6 +219,11 @@ class OneBotMsg(_PluginBase):
             "dropped": 0,
             "filtered": 0,
             "deduped": 0,
+            # WS 通道收到 message_sent 的次数，代表"确实发出去了"的消息数
+            "confirmed": 0,
+            "images": 0,
+            "images_fallback": 0,
+            "reacted": 0,
         }
 
     # ------------------------------------------------------------- 生命周期
@@ -173,6 +238,7 @@ class OneBotMsg(_PluginBase):
         self._reset_runtime()
 
         self._enabled = bool(config.get("enabled"))
+        self._transport_kind = normalize_transport(config.get("transport"))
         self._api_url = str(config.get("api_url") or "").strip()
         self._access_token = str(config.get("access_token") or "").strip()
         self._targets_text = str(config.get("targets") or "")
@@ -190,21 +256,35 @@ class OneBotMsg(_PluginBase):
         self._msgtypes = list(_DEFAULT_TYPES) if raw_msgtypes is None \
             else _as_list(raw_msgtypes)
         self._send_image = bool(config.get("send_image", True))
+        self._image_mode = str(config.get("image_mode") or IMAGE_MODE_AUTO).strip() \
+            or IMAGE_MODE_AUTO
+        self._max_image_mb = _as_float(config.get("max_image_mb"), 3.0)
         self._send_link = bool(config.get("send_link", True))
         self._at_in_group = bool(config.get("at_in_group"))
         self._title_prefix = str(config.get("title_prefix") or "")
+        self._style = normalize_style(config.get("style"))
+        self._send_mode = str(config.get("send_mode") or SEND_MODE_TEXT).strip() \
+            or SEND_MODE_TEXT
+        self._forward_threshold = _as_int(config.get("forward_threshold"),
+                                          _FORWARD_HINT_ROWS)
+        self._react_on_success = bool(config.get("react_on_success"))
         self._max_length = _as_int(config.get("max_length"), _DEFAULT_MAX_LENGTH)
+        self._card_width = _as_int(config.get("card_width"), DEFAULT_MAX_WIDTH)
         self._dedupe_seconds = _as_int(config.get("dedupe_seconds"), 20)
         self._rate_limit = _as_float(config.get("rate_limit"), 3.0)
         self._retries = _as_int(config.get("retries"), 2)
 
-        self._client = OneBotClient(
-            base_url=self._api_url,
+        # WS 通道在收到 message_sent 时记录回执，用于确认「消息真的发出去了」。
+        self._transport = build_transport(
+            kind=self._transport_kind,
+            url=self._api_url,
             access_token=self._access_token,
+            timeout=12.0,
             retries=self._retries,
             rate_limit=self._rate_limit,
             rate_burst=max(self._rate_limit * 2, 2.0),
             dedupe_ttl=max(self._dedupe_seconds, 0),
+            on_event=self._on_transport_event,
         )
 
         if not self._enabled:
@@ -213,10 +293,26 @@ class OneBotMsg(_PluginBase):
 
         self._start_worker()
         logger.info(
-            f"OneBot v11 通知插件已启用：接口={self._api_url or '未配置'}，"
+            f"OneBot v11 通知插件已启用：通道={TRANSPORT_LABELS.get(self._transport_kind)}，"
+            f"地址={self._api_url or '未配置'}，"
             f"私聊目标={len(self._private_users)}，群目标={len(self._groups)}，"
-            f"用户映射={len(self._user_targets)}"
+            f"用户映射={len(self._user_targets)}，排版={self._style}"
         )
+
+    def _on_transport_event(self, event: Dict[str, Any]) -> None:
+        """处理 WS 通道推送的事件。
+
+        目前只关心 ``message_sent``（自己发出的消息）：把它记为一次真实投递，
+        并缓存消息 ID 供后续贴表情回复使用。
+        """
+        if not isinstance(event, dict):
+            return
+        if event.get("post_type") != "message_sent":
+            return
+        message_id = event.get("message_id")
+        if message_id is not None:
+            self._last_message_id = message_id
+        self._bump("confirmed")
 
     def get_state(self) -> bool:
         """返回插件是否处于可用状态。
@@ -230,20 +326,32 @@ class OneBotMsg(_PluginBase):
         )
 
     def stop_service(self) -> None:
-        """停止插件并释放队列、线程与去重缓存，可安全重复调用。"""
+        """停止插件并释放队列、线程与连接，可安全重复调用。"""
         self._stop_worker()
         self._accepting = False
-        if self._client is not None:
+        transport = self._transport
+        if transport is not None:
             try:
-                self._client.clear_dedupe()
+                transport.close()
             except Exception as err:  # noqa: BLE001
-                logger.debug(f"清理去重缓存失败：{err}")
+                logger.debug(f"关闭传输失败：{err}")
+            dedupe = getattr(transport, "dedupe", None)
+            if dedupe is not None:
+                try:
+                    dedupe.clear()
+                except Exception as err:  # noqa: BLE001
+                    logger.debug(f"清理去重缓存失败：{err}")
         logger.info("OneBot v11 通知插件已停止")
 
     def close(self) -> None:
         """兼容新版宿主的第一阶段关闭钩子。"""
         self._stop_worker()
         self._accepting = False
+        if self._transport is not None:
+            try:
+                self._transport.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _start_worker(self) -> None:
         """启动发送队列工作线程。"""
@@ -288,50 +396,271 @@ class OneBotMsg(_PluginBase):
                 self._queue.task_done()
 
     def _dispatch_task(self, task: Dict[str, Any]) -> None:
-        """执行一条发送任务并记录统计。"""
-        client = self._client
-        if client is None:
+        """执行一条发送任务并记录统计。
+
+        一条任务可能包含文本、图片与链接：文本按配置的排版样式渲染，图片按
+        「URL → base64」候选顺序尝试，链接按开关附带。
+        """
+        transport = self._transport
+        if transport is None:
             return
-        segments = task.get("segments") or []
         user_ids = task.get("user_ids") or []
         group_ids = task.get("group_ids") or []
-        at_user = task.get("at_user")
+        at_user = task.get("at_user") if self._at_in_group else None
         title = task.get("title") or "MoviePilot 通知"
+        text = task.get("text")
+        link = task.get("link")
+        emoji = task.get("emoji") or ""
+        image = task.get("image") if self._send_image else None
+        mode = task.get("send_mode") or self._send_mode
 
         if not user_ids and not group_ids:
             self._bump("dropped")
             logger.warning(f"OneBot 通知没有可用目标，已丢弃：{title}")
             return
 
-        chunks = split_segments(segments, self._max_length)
-        results: List[OneBotResponse] = []
-        for index, chunk in enumerate(chunks):
-            # 多段时在段落首行标注序号，便于在聊天窗口中区分。
-            payload: Union[str, List[Dict[str, Any]]] = chunk
-            if len(chunks) > 1 and isinstance(chunk, list) and chunk:
-                chunk = list(chunk)
-                chunk[0] = build_text_segment(
-                    f"({index + 1}/{len(chunks)}) {_segment_text(chunk[0])}"
-                )
-                payload = chunk
-            results.extend(client.send_notification(
-                message=payload,
-                user_ids=user_ids,
-                group_ids=group_ids,
-                at_user=at_user if self._at_in_group else None,
-            ))
+        # 明细行数够多时，合并转发比一坨长文本更整洁；未显式配置时按行数自动选择。
+        if mode == "auto":
+            rows = len([line for line in str(text or "").split("\n") if line.strip()])
+            mode = SEND_MODE_FORWARD if rows >= max(self._forward_threshold, 1) \
+                else SEND_MODE_TEXT
+        if mode not in (SEND_MODE_TEXT, SEND_MODE_FORWARD):
+            mode = SEND_MODE_TEXT
 
-        ok_count = sum(1 for result in results if result.ok)
-        if results and ok_count == len(results):
+        if task.get("raw"):
+            # 成品文本（命令回执/测试卡片）：按原文发送，不再排版。
+            sent, detail = self._send_text_to_targets(
+                transport, str(text or ""), user_ids, group_ids, at_user,
+            )
+        elif mode == SEND_MODE_FORWARD:
+            sent, detail = self._dispatch_forward(
+                transport, emoji=emoji, title=title, text=text, link=link,
+                user_ids=user_ids, group_ids=group_ids, at_user=at_user,
+            )
+        else:
+            sent, detail = self._dispatch_card(
+                transport, emoji=emoji, title=title, text=text, link=link,
+                image=image, user_ids=user_ids, group_ids=group_ids, at_user=at_user,
+            )
+
+        if sent:
             self._bump("sent")
-            logger.info(f"OneBot 通知已发送：{title}（{len(results)} 个目标）")
+            logger.info(f"OneBot 通知已发送：{title}（{detail}）")
+            self._maybe_react(transport)
         else:
             self._bump("failed")
-            errors = [f"{r.action}: {r.error}" for r in results if not r.ok]
-            logger.warn(
-                f"OneBot 通知部分或全部发送失败：{title}；"
-                f"成功 {ok_count}/{len(results)}；{'; '.join(errors[:3])}"
+            logger.warn(f"OneBot 通知发送失败：{title}；{detail}")
+
+    def _maybe_react(self, transport: Transport) -> None:
+        """按配置给刚发出的消息贴一个表情回复。
+
+        这是 NapCat 扩展动作，老版本可能不支持；失败只记 debug，绝不影响通知本身。
+        需要消息 ID，因此只有能拿到 message_id 的通道（HTTP 响应或 WS 回执）才有效。
+        """
+        if not self._react_on_success:
+            return
+        message_id = self._last_message_id
+        if message_id is None:
+            return
+        ok, detail = set_reaction(transport, message_id)
+        if ok:
+            self._bump("reacted")
+        else:
+            logger.debug(f"表情回复未生效：{detail}")
+
+    def _dispatch_card(self, transport: Transport, *, emoji: str, title: str,
+                       text: Optional[str], link: Optional[str],
+                       image: Optional[str], user_ids: List[str],
+                       group_ids: List[str], at_user: Optional[str],
+                       allow_image_fallback: bool = True) -> Tuple[bool, str]:
+        """按卡片样式发送：文本 + 可选图片 + 可选链接。"""
+        card = build_card(
+            emoji=emoji,
+            title=title,
+            text=text,
+            link=link if self._send_link else None,
+            style=self._style,
+            prefix=self._title_prefix,
+            max_width=self._card_width,
+        )
+        chunks = _split_text(card, self._max_length)
+        results: List[OneBotResponse] = []
+        for index, chunk in enumerate(chunks):
+            body = chunk if len(chunks) == 1 else f"({index + 1}/{len(chunks)})\n{chunk}"
+            for user_id in user_ids:
+                params: Dict[str, Any] = {
+                    "user_id": str(user_id),
+                    "message": [text_segment(body)],
+                }
+                result = transport.call("send_private_msg", params)
+                if result is not None:
+                    results.append(result)
+                if result is not None and result.ok and result.message_id is not None:
+                    self._last_message_id = result.message_id
+            for group_id in group_ids:
+                segments: List[Dict[str, Any]] = []
+                if at_user:
+                    segments.append({"type": "at", "data": {"qq": str(at_user)}})
+                segments.append(text_segment(body))
+                result = transport.call("send_group_msg", {
+                    "group_id": str(group_id),
+                    "message": segments,
+                })
+                if result is not None:
+                    results.append(result)
+                if result is not None and result.ok and result.message_id is not None:
+                    self._last_message_id = result.message_id
+
+        failed = [result for result in results if not result.ok]
+        if not results:
+            return False, "没有产生任何调用"
+        if failed:
+            errors = [f"{r.action}: {r.error}" for r in failed[:3]]
+            return False, f"成功 {len(results) - len(failed)}/{len(results)}；{'; '.join(errors)}"
+
+        # 文本成功后补发图片；图片失败不回滚文本，只记录并降级说明。
+        detail = f"{len(results)} 个目标"
+        if image:
+            image_ok, image_detail = self._send_image_to_targets(
+                transport, image=image, user_ids=user_ids, group_ids=group_ids,
             )
+            if image_ok:
+                self._bump("images")
+                detail = f"{detail}；{image_detail}"
+            else:
+                detail = f"{detail}；图片未发送（{image_detail}）"
+                if allow_image_fallback and self._style != STYLE_PLAIN:
+                    logger.debug(f"图片发送失败：{image_detail}")
+        return True, detail
+
+    def _send_text_to_targets(self, transport: Transport, text: str,
+                              user_ids: List[str], group_ids: List[str],
+                              at_user: Optional[str] = None) -> Tuple[bool, str]:
+        """把一段**已渲染好**的文本原样发给所有目标。
+
+        命令回执、测试消息这类内容本身就是成品卡片，不能再套一层排版
+        （``build_card`` 需要标题或正文，直接传成品会被判空丢弃）。
+        """
+        body = str(text or "")
+        if not body:
+            return False, "内容为空"
+        chunks = _split_text(body, self._max_length)
+        results: List[OneBotResponse] = []
+        for index, chunk in enumerate(chunks):
+            payload = chunk if len(chunks) == 1 else f"({index + 1}/{len(chunks)})\n{chunk}"
+            for user_id in user_ids:
+                result = transport.call("send_private_msg", {
+                    "user_id": str(user_id),
+                    "message": [text_segment(payload)],
+                })
+                if result is not None:
+                    results.append(result)
+                    if result.ok and result.message_id is not None:
+                        self._last_message_id = result.message_id
+            for group_id in group_ids:
+                segments: List[Dict[str, Any]] = []
+                if at_user:
+                    segments.append({"type": "at", "data": {"qq": str(at_user)}})
+                segments.append(text_segment(payload))
+                result = transport.call("send_group_msg", {
+                    "group_id": str(group_id),
+                    "message": segments,
+                })
+                if result is not None:
+                    results.append(result)
+                    if result.ok and result.message_id is not None:
+                        self._last_message_id = result.message_id
+        if not results:
+            return False, "没有产生任何调用"
+        failed = [result for result in results if not result.ok]
+        if failed:
+            errors = [f"{r.action}: {r.error}" for r in failed[:3]]
+            return False, f"成功 {len(results) - len(failed)}/{len(results)}；{'; '.join(errors)}"
+        return True, f"{len(results)} 个目标"
+
+    def _send_image_to_targets(self, transport: Transport, *, image: str,
+                              user_ids: List[str], group_ids: List[str],
+                              ) -> Tuple[bool, str]:
+        """把图片按候选形式发给所有目标，任一形式成功即算成功。"""
+        target_dir = None
+        try:
+            target_dir = self.get_data_path() / "images"
+        except Exception as err:  # noqa: BLE001 - 数据目录不可用时仍可走 URL/base64
+            logger.debug(f"获取插件数据目录失败，图片仅支持 URL/base64：{err}")
+        try:
+            max_bytes = int(max(self._max_image_mb, 0.1) * 1024 * 1024)
+        except (TypeError, ValueError):
+            max_bytes = 3 * 1024 * 1024
+        candidates, notes = normalize_image_candidates(
+            image, target_dir=target_dir, mode=self._image_mode, max_bytes=max_bytes,
+        )
+        if not candidates:
+            return False, "；".join(notes) or "没有可用的图片形式"
+
+        outcomes: List[str] = list(notes)
+        for index, file_value in enumerate(candidates):
+            ok_all = True
+            for user_id in user_ids:
+                ok, detail = send_image(
+                    transport, message_type="private", user_id=user_id,
+                    candidates=[file_value],
+                )
+                outcomes.append(detail)
+                ok_all = ok_all and ok
+            for group_id in group_ids:
+                ok, detail = send_image(
+                    transport, message_type="group", group_id=group_id,
+                    candidates=[file_value],
+                )
+                outcomes.append(detail)
+                ok_all = ok_all and ok
+            if ok_all:
+                if index > 0:
+                    self._bump("images_fallback")
+                return True, "；".join(outcomes[-max(len(user_ids) + len(group_ids), 1):])
+        return False, "；".join(outcomes[-3:])
+
+    def _dispatch_forward(self, transport: Transport, *, emoji: str, title: str,
+                          text: Optional[str], link: Optional[str],
+                          user_ids: List[str], group_ids: List[str],
+                          at_user: Optional[str]) -> Tuple[bool, str]:
+        """以合并转发形式发送（NapCat 扩展动作）。
+
+        该动作需要 NapCat 支持；若返回失败，自动降级为卡片文本，保证通知不断。
+        """
+        nodes = build_forward_nodes(
+            emoji=emoji, title=title, text=text,
+            link=link if self._send_link else None,
+            bot_name=self.plugin_name, bot_uin="10000",
+        )
+        if not nodes:
+            return False, "没有可发送的内容"
+        results: List[str] = []
+        ok_count = 0
+        total = 0
+        for user_id in user_ids:
+            total += 1
+            ok, detail = send_forward(
+                transport, message_type="private", nodes=nodes, user_id=user_id,
+            )
+            ok_count += 1 if ok else 0
+            results.append(detail)
+        for group_id in group_ids:
+            total += 1
+            # 合并转发节点里已含标题，群里再 @ 一次会多一条消息，因此这里不重复 @。
+            ok, detail = send_forward(
+                transport, message_type="group", nodes=nodes, group_id=group_id,
+            )
+            ok_count += 1 if ok else 0
+            results.append(detail)
+        if total and ok_count == total:
+            return True, f"合并转发 {ok_count} 个目标"
+        logger.debug(f"合并转发失败，降级为卡片文本：{results[:2]}")
+        sent, detail = self._dispatch_card(
+            transport, emoji=emoji, title=title, text=text, link=link,
+            image=None, user_ids=user_ids, group_ids=group_ids, at_user=at_user,
+        )
+        return sent, f"合并转发不可用，已降级：{detail}"
 
     def _bump(self, key: str, delta: int = 1) -> None:
         """累加运行统计。"""
@@ -381,30 +710,22 @@ class OneBotMsg(_PluginBase):
 
         # 同一事件可能因为路由（admin/user/all）被派发多次，这里做短期去重。
         dedupe_key = _dedupe_key(type_name, title, text, data.get("image"))
-        client = self._client
-        if client is not None and client.dedupe.seen(dedupe_key):
+        dedupe = getattr(self._transport, "dedupe", None)
+        if dedupe is not None and dedupe.seen(dedupe_key):
             self._bump("deduped")
             logger.debug(f"检测到重复通知，已跳过：{title}")
             return
 
-        image = data.get("image") if self._send_image else None
-        link = data.get("link") if self._send_link else None
-
-        segments = self._build_segments(
-            emoji=_type_emoji(type_name),
-            title=title,
-            text=text,
-            image=str(image) if image else None,
-            link=str(link) if link else None,
-        )
-
-        self._enqueue(
+        self._enqueue_task(self._task(
             title=title or "MoviePilot 通知",
-            segments=segments,
+            text=text,
+            emoji=_type_emoji(type_name),
+            image=str(data.get("image")) if data.get("image") else None,
+            link=str(data.get("link")) if data.get("link") else None,
             userid=data.get("userid"),
             username=data.get("username"),
             targets=data.get("targets"),
-        )
+        ))
 
     @eventmanager.register(EventType.TransferComplete)
     def on_transfer_complete(self, event: Event) -> None:
@@ -488,25 +809,19 @@ class OneBotMsg(_PluginBase):
             lines.append(f"失败文件：{len(fail_list)} 个")
 
         emoji = "✅" if success else "❌"
-        title_text = f"{emoji} {'整理入库' if success else '整理失败'} {heading}"
+        title_text = f"{'整理入库' if success else '整理失败'} {heading}"
         if not lines:
             lines.append("宿主持久化整理任务已完成")
 
-        # 标题已包含状态图标，不再重复插入 emoji。
-        segments = self._build_segments(
-            emoji="",
+        # 标题单独带 emoji，正文只放字段行，卡片渲染时会自动对齐。
+        self._enqueue_task(self._task(
             title=title_text,
             text="\n".join(lines),
-            image=None,
+            emoji=emoji,
             link=str(info.get("link") or "") or None,
-        )
-        self._enqueue(
-            title=title_text,
-            segments=segments,
-            userid=None,
-            username=None,
-            targets=None,
-        )
+            image=_first_value(info, "image", "poster", "backdrop")
+            or str(media.get("poster_path") or media.get("backdrop_path") or "") or None,
+        ))
 
     # ------------------------------------------------------------ 目标解析
 
@@ -563,51 +878,59 @@ class OneBotMsg(_PluginBase):
                  username: Optional[Union[str, int]],
                  targets: Optional[Dict[str, Any]]) -> None:
         """解析目标后把一条通知放入发送队列。"""
+        self._enqueue_task(self._task(
+            title=title, text=text, emoji=emoji, link=link, image=image,
+            userid=userid, username=username, targets=targets,
+        ))
+
+    # ------------------------------------------------------------ 消息构造
+
+    def _task(self, *, title: str, text: Optional[str] = None, emoji: str = "",
+              link: Optional[str] = None, image: Optional[str] = None,
+              send_mode: Optional[str] = None,
+              userid: Optional[Union[str, int]] = None,
+              username: Optional[Union[str, int]] = None,
+              targets: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """构造一条待发送任务。
+
+        任务只保存原始素材（标题/正文/图片/链接），真正的排版在发送时按当前配置
+        完成：这样改排版样式或图片方式不需要重新入队，也让两种传输共用同一份渲染。
+        """
+        return {
+            "title": str(title or "MoviePilot 通知"),
+            "text": str(text or ""),
+            "emoji": str(emoji or ""),
+            "link": str(link) if link else None,
+            "image": str(image) if image else None,
+            "send_mode": send_mode,
+            "userid": userid,
+            "username": username,
+            "targets": targets,
+        }
+
+    def _enqueue_task(self, task: Dict[str, Any]) -> None:
+        """解析目标后把任务放入队列。"""
+        title = task.get("title") or "MoviePilot 通知"
         if not self._accepting:
             self._bump("dropped")
             logger.debug(f"插件未处于接收状态，丢弃通知：{title}")
             return
-
-        users, groups, at_user = self._resolve_targets(userid, username, targets)
+        users, groups, at_user = self._resolve_targets(
+            task.get("userid"), task.get("username"), task.get("targets"),
+        )
         if not users and not groups:
             self._bump("dropped")
             logger.warning(f"没有可用的 QQ 目标，通知未发送：{title}")
             return
-
-        task = {
-            "title": title,
-            "segments": segments,
+        task.update({
             "user_ids": users,
             "group_ids": groups,
             "at_user": at_user,
             "enqueued_at": time.time(),
-        }
+        })
+        # 兼容旧字段名：部分调用方仍读取 segments。
+        task.setdefault("segments", [])
         self._queue_put(task, title)
-
-    # ------------------------------------------------------------ 消息构造
-
-    def _build_segments(self, emoji: str, title: str, text: Optional[str],
-                        image: Optional[str], link: Optional[str],
-                        max_text: int = 0) -> List[Dict[str, Any]]:
-        """构造 OneBot 消息段列表：标题、正文、图片、链接。"""
-        prefix = f"{emoji} " if emoji else ""
-        heading = f"{prefix}{title}".strip()
-        if self._title_prefix:
-            heading = f"{self._title_prefix} {heading}".strip()
-
-        lines: List[str] = [heading]
-        body = str(text or "").strip()
-        if body:
-            limit = max_text or self._max_length
-            # 为标题与链接预留空间，避免整段消息超长被 NapCat 拒绝。
-            lines.append(shorten(body, max(limit - len(heading) - 64, 120)))
-        if link:
-            lines.append(f"🔗 {link}")
-
-        segments: List[Dict[str, Any]] = [build_text_segment("\n".join(lines))]
-        if image:
-            segments.append(build_image_segment(image))
-        return segments
 
     # --------------------------------------------------------------- 命令
 
@@ -645,9 +968,14 @@ class OneBotMsg(_PluginBase):
             return
 
         if action == "onebot_status":
-            text = self._status_text()
+            card = self._status_card()
+            title = "OneBot 通知运行状态"
+            text = None
         else:
-            text = self.send_test_message().message
+            result = self.send_test_message()
+            card = result.message
+            title = "OneBot 通知插件"
+            text = None
 
         # 回执优先发回下命令的会话，无法识别时使用插件配置的目标。
         users, groups, _ = self._resolve_targets()
@@ -658,15 +986,22 @@ class OneBotMsg(_PluginBase):
             groups = [str(sender_group)] if sender_group else []
 
         self._enqueue_to(
-            title="OneBot 通知插件",
-            segments=[build_text_segment(f"🧩 {text}")],
+            title=title,
+            text=card,
+            emoji="🧩",
             user_ids=users,
             group_ids=groups,
+            raw=True,
         )
 
-    def _enqueue_to(self, title: str, segments: List[Dict[str, Any]],
-                    user_ids: List[str], group_ids: List[str]) -> None:
-        """把一条已经确定目标的消息放入发送队列。"""
+    def _enqueue_to(self, title: str, user_ids: List[str], group_ids: List[str],
+                    text: Optional[str] = None,
+                    emoji: str = "", raw: bool = False) -> None:
+        """把一条已经确定目标的消息放入发送队列。
+
+        ``raw=True`` 表示 ``text`` 已是渲染好的成品（如状态卡片），发送时按原始
+        样式直出，不再套一层卡片边框。
+        """
         if not self._accepting:
             self._bump("dropped")
             logger.debug(f"插件未处于接收状态，丢弃通知：{title}")
@@ -677,10 +1012,17 @@ class OneBotMsg(_PluginBase):
             return
         task = {
             "title": title,
-            "segments": segments,
+            "text": str(text or ""),
+            "emoji": emoji,
+            "link": None,
+            "image": None,
+            "send_mode": SEND_MODE_TEXT,
+            # 已是成品卡片：发送时按原始文本直出，不再套排版。
+            "raw": bool(raw),
             "user_ids": user_ids,
             "group_ids": group_ids,
             "at_user": None,
+            "segments": [],
             "enqueued_at": time.time(),
         }
         self._queue_put(task, title)
@@ -704,18 +1046,35 @@ class OneBotMsg(_PluginBase):
                 logger.warning(f"发送队列繁忙，通知被丢弃：{title}")
 
     def _status_text(self) -> str:
-        """生成运行状态摘要。"""
+        """生成纯文本运行状态摘要（供日志与 API 使用）。"""
         stats = self._stats or {}
         return (
             "OneBot 通知插件运行中\n"
-            f"接口：{self._api_url or '未配置'}\n"
+            f"通道：{describe_transport(self._transport)}\n"
             f"私聊目标：{len(self._private_users)} 个；群目标：{len(self._groups)} 个；"
             f"用户映射：{len(self._user_targets)} 条\n"
             f"队列：{self._queue.qsize()} 待发送\n"
             f"统计：接收 {stats.get('received', 0)}，"
             f"发送成功 {stats.get('sent', 0)}，失败 {stats.get('failed', 0)}，"
             f"过滤 {stats.get('filtered', 0)}，去重 {stats.get('deduped', 0)}，"
-            f"丢弃 {stats.get('dropped', 0)}"
+            f"丢弃 {stats.get('dropped', 0)}，"
+            f"图片 {stats.get('images', 0)}（降级 {stats.get('images_fallback', 0)}），"
+            f"投递回执 {stats.get('confirmed', 0)}"
+        )
+
+    def _status_card(self) -> str:
+        """生成一条可直接发送的状态卡片。"""
+        stats = self._stats or {}
+        targets = f"私聊 {len(self._private_users)} / 群 {len(self._groups)} / 映射 {len(self._user_targets)}"
+        return build_status_card(
+            plugin_name=self.plugin_name,
+            version=self.plugin_version,
+            transport_label=TRANSPORT_LABELS.get(self._transport_kind, self._transport_kind),
+            endpoint=self._api_url,
+            stats=stats,
+            queue_size=self._queue.qsize(),
+            targets=targets,
+            style=self._style,
         )
 
     # ---------------------------------------------------------------- API
@@ -747,47 +1106,91 @@ class OneBotMsg(_PluginBase):
                 "summary": "查询插件运行状态",
                 "response_model": PushResult,
             },
+            {
+                "path": "/preview",
+                "endpoint": self.preview_layout,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "预览三种排版样式的渲染结果（不发送）",
+                "response_model": PushResult,
+            },
+            {
+                "path": "/probe",
+                "endpoint": self.probe_capabilities,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "探测 NapCat 版本与图片发送能力",
+                "response_model": PushResult,
+            },
         ]
 
     def send_test_message(self, payload: Optional[dict] = None) -> PushResult:
-        """发送一条测试消息，验证接口与目标配置是否正确。"""
+        """发送一条测试消息，验证连接方式、目标与排版是否正确。
+
+        测试同步发送（不复用队列），这样页面上点一下就能立刻看到真实结果；
+        返回的 ``message`` 里带上渲染后的卡片，便于直接在界面上核对排版。
+        """
         if not self._enabled:
             return PushResult(success=False, message="插件未启用")
-        users, groups, at_user = self._resolve_targets()
+        users, groups, _at_user = self._resolve_targets()
         if not self._api_url:
-            return PushResult(success=False, message="未配置 OneBot 接口地址")
+            return PushResult(success=False, message="未配置 OneBot 地址")
         if not users and not groups:
             return PushResult(success=False, message="未配置任何 QQ 目标")
 
-        # 测试消息直接同步发送，便于页面立即看到真实结果。
-        client = OneBotClient(
-            base_url=self._api_url,
-            access_token=self._access_token,
-            retries=self._retries,
+        # 用当前配置临时构造传输，避免与工作线程争用同一条长连接。
+        probe = build_transport(
+            kind=self._transport_kind, url=self._api_url,
+            access_token=self._access_token, timeout=12.0, retries=0,
             rate_limit=self._rate_limit,
         )
-        text = (
-            "✅ OneBot 通知测试\n"
-            f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"发送者：MoviePilot {self.plugin_name} v{self.plugin_version}"
+        transport_label = TRANSPORT_LABELS.get(self._transport_kind, self._transport_kind)
+        target_summary = f"私聊 {len(users)} / 群 {len(groups)}"
+        card = build_test_card(
+            plugin_name=self.plugin_name,
+            version=self.plugin_version,
+            transport_label=transport_label,
+            target_summary=target_summary,
+            now_text=time.strftime("%Y-%m-%d %H:%M:%S"),
+            style=self._style,
         )
-        results = client.send_notification(
-            message=[build_text_segment(text)],
-            user_ids=users,
-            group_ids=groups,
-            at_user=at_user if self._at_in_group else None,
-        )
-        ok_count = sum(1 for result in results if result.ok)
-        if results and ok_count == len(results):
-            return PushResult(success=True,
-                              message=f"测试消息发送成功，共 {ok_count} 个目标",
-                              targets=ok_count)
-        errors = "; ".join(f"{r.action}: {r.error}" for r in results if not r.ok)
-        return PushResult(
-            success=False,
-            message=f"测试消息发送失败（成功 {ok_count}/{len(results)}）：{errors[:300]}",
-            targets=ok_count,
-        )
+        try:
+            sent, detail = self._send_text_to_targets(probe, card, users, groups)
+            if not sent:
+                # 单条模式失败时，尝试用合并转发兜底，顺便验证扩展动作是否可用。
+                nodes = build_forward_nodes(
+                    "✅", "OneBot 通知测试",
+                    f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+                    None, bot_name=self.plugin_name,
+                )
+                forward_ok = False
+                for user_id in users:
+                    ok, _ = send_forward(probe, message_type="private",
+                                         nodes=nodes, user_id=user_id)
+                    forward_ok = forward_ok or ok
+                for group_id in groups:
+                    ok, _ = send_forward(probe, message_type="group",
+                                         nodes=nodes, group_id=group_id)
+                    forward_ok = forward_ok or ok
+                if forward_ok:
+                    return PushResult(
+                        success=True,
+                        message=(f"单条消息发送失败（{shorten(detail, 200)}），"
+                                 f"已改用合并转发成功"),
+                        targets=len(users) + len(groups),
+                    )
+                return PushResult(
+                    success=False,
+                    message=f"测试消息发送失败：{detail}",
+                    targets=0,
+                )
+            return PushResult(
+                success=True,
+                message=f"测试消息发送成功（{detail}）\n\n{card}",
+                targets=len(users) + len(groups),
+            )
+        finally:
+            probe.close()
 
     def push_custom_message(self, payload: Optional[dict] = None) -> PushResult:
         """推送自定义通知，供工作流或外部系统调用。"""
@@ -802,6 +1205,9 @@ class OneBotMsg(_PluginBase):
         image = str(payload.get("image") or "").strip() or None
         link = str(payload.get("link") or "").strip() or None
         emoji = str(payload.get("emoji") or "📢").strip()
+        # 调用方可临时指定发送方式与排版样式，未提供时沿用插件配置。
+        send_mode = payload.get("send_mode")
+        style = payload.get("style")
 
         # 允许调用方临时覆盖目标，未提供时使用插件配置。
         override = payload.get("target")
@@ -813,21 +1219,24 @@ class OneBotMsg(_PluginBase):
         if not users and not groups:
             return PushResult(success=False, message="没有可用的 QQ 目标")
 
-        segments = self._build_segments(
-            emoji=emoji,
+        task = self._task(
             title=title or "MoviePilot 通知",
             text=text,
+            emoji=emoji,
             image=image if self._send_image else None,
             link=link if self._send_link else None,
+            send_mode=str(send_mode) if send_mode else None,
         )
-        task = {
-            "title": title or "自定义通知",
-            "segments": segments,
+        task.update({
             "user_ids": users,
             "group_ids": groups,
             "at_user": None,
+            "segments": [],
             "enqueued_at": time.time(),
-        }
+        })
+        if style:
+            task["style"] = normalize_style(style)
+
         if self._accepting:
             try:
                 self._queue.put_nowait(task)
@@ -838,17 +1247,22 @@ class OneBotMsg(_PluginBase):
                 return PushResult(success=False, message="发送队列已满，请稍后重试")
 
         # 停用态下仍允许手动推送：直接同步发送一次。
-        client = OneBotClient(
-            base_url=self._api_url,
-            access_token=self._access_token,
-            retries=self._retries,
+        probe = build_transport(
+            kind=self._transport_kind, url=self._api_url,
+            access_token=self._access_token, retries=0,
             rate_limit=self._rate_limit,
         )
-        results = client.send_notification(segments, user_ids=users, group_ids=groups)
-        ok_count = sum(1 for result in results if result.ok)
-        return PushResult(success=ok_count > 0,
-                          message=f"直接发送完成，成功 {ok_count}/{len(results)}",
-                          targets=ok_count)
+        try:
+            sent, detail = self._dispatch_card(
+                transport=probe, emoji=emoji, title=title or "MoviePilot 通知",
+                text=text, link=task.get("link"), image=task.get("image"),
+                user_ids=users, group_ids=groups, at_user=None,
+            )
+            return PushResult(success=sent,
+                              message=f"直接发送完成：{detail}",
+                              targets=len(users) + len(groups) if sent else 0)
+        finally:
+            probe.close()
 
     def get_runtime_status(self, payload: Optional[dict] = None) -> PushResult:
         """返回插件运行状态摘要。"""
@@ -860,6 +1274,62 @@ class OneBotMsg(_PluginBase):
 
     # ----------------------------------------------------------- 表单与页面
 
+    @staticmethod
+    def _field(model: str, label: str, *, kind: str = "VTextField",
+               placeholder: Optional[str] = None, hint: Optional[str] = None,
+               items: Optional[List[dict]] = None, multiple: bool = False,
+               rows: Optional[int] = None, field_type: Optional[str] = None,
+               min_value: Optional[float] = None,
+               md: int = 6) -> dict:
+        """构造一个表单项（列 + 组件）。
+
+        用工厂方法而不是逐项手写，是为了让新增配置项只需一行——这个插件的配置项
+        已经接近 20 个，手写 JSON 很容易漏字段或写错层级。
+        """
+        props: Dict[str, Any] = {"model": model, "label": label}
+        if placeholder is not None:
+            props["placeholder"] = placeholder
+        if hint:
+            props["hint"] = hint
+            props["persistent-hint"] = True
+        if items is not None:
+            props["items"] = items
+        if multiple:
+            props["multiple"] = True
+            props["chips"] = True
+            props["clearable"] = True
+        if rows is not None:
+            props["rows"] = rows
+        if field_type:
+            props["type"] = field_type
+        if min_value is not None:
+            props["min"] = min_value
+        return {
+            "component": "VCol",
+            "props": {"cols": 12, "md": md},
+            "content": [{"component": kind, "props": props}],
+        }
+
+    @staticmethod
+    def _section(title: str, hint: str, *fields: dict) -> dict:
+        """把若干字段归到一个带说明的区块里，便于在一个长表单中定位。"""
+        return {
+            "component": "VRow",
+            "content": [
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [
+                        {"component": "VAlert",
+                         "props": {"type": "info", "variant": "tonal",
+                                   "density": "compact",
+                                   "text": f"{title}：{hint}"}},
+                    ],
+                },
+                *fields,
+            ],
+        }
+
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """返回插件配置页面与默认配置。"""
         type_options = [
@@ -870,321 +1340,276 @@ class OneBotMsg(_PluginBase):
             }
             for name in _MESSAGE_TYPE_STYLE
         ]
-        return [
-            {
-                "component": "VForm",
-                "content": [
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "enabled",
-                                            "label": "启用插件",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "send_image",
-                                            "label": "附带海报图片",
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "api_url",
-                                            "label": "OneBot 接口地址",
-                                            "placeholder": "http://127.0.0.1:3000",
-                                            "hint": "NapCat WebUI 中「网络配置 - HTTP 服务器」的地址与端口",
-                                            "persistent-hint": True,
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 6},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "access_token",
-                                            "label": "Access Token",
-                                            "placeholder": "与 NapCat 配置保持一致，未设置则留空",
-                                            "type": "password",
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VTextarea",
-                                        "props": {
-                                            "model": "targets",
-                                            "label": "默认推送目标",
-                                            "placeholder": "123456789\n群:987654321",
-                                            "hint": "每行一个；裸 QQ 号按私聊发送，群号必须加前缀，例如 group:987654321 或 群:987654321",
-                                            "persistent-hint": True,
-                                            "rows": 3,
-                                        },
-                                    }
-                                ],
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VTextarea",
-                                        "props": {
-                                            "model": "user_targets",
-                                            "label": "用户定向推送（可选）",
-                                            "placeholder": "admin=123456789\nalice=111111,群:222222",
-                                            "hint": "按 MoviePilot 用户名定向推送；未命中的用户回落到默认目标",
-                                            "persistent-hint": True,
-                                            "rows": 3,
-                                        },
-                                    }
-                                ],
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VSelect",
-                                        "props": {
-                                            "multiple": True,
-                                            "chips": True,
-                                            "clearable": True,
-                                            "model": "msgtypes",
-                                            "label": "推送的消息类型",
-                                            "items": type_options,
-                                        },
-                                    }
-                                ],
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "send_link",
-                                            "label": "附带链接",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VSwitch",
-                                        "props": {
-                                            "model": "at_in_group",
-                                            "label": "群消息 @ 用户",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "title_prefix",
-                                            "label": "标题前缀",
-                                            "placeholder": "例如 [MoviePilot]",
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "max_length",
-                                            "label": "单条消息最大长度",
-                                            "placeholder": "1200",
-                                            "type": "number",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "dedupe_seconds",
-                                            "label": "去重时间窗口（秒）",
-                                            "placeholder": "20",
-                                            "type": "number",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "rate_limit",
-                                            "label": "每秒最大发送条数",
-                                            "placeholder": "3",
-                                            "type": "number",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 3},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "retries",
-                                            "label": "失败重试次数",
-                                            "placeholder": "2",
-                                            "type": "number",
-                                        },
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "info",
-                                            "variant": "tonal",
-                                            "text": (
-                                                "使用前请在 NapCat 的「网络配置」中启用 HTTP 服务器"
-                                                "（默认 127.0.0.1:3000）并配置 Access Token，"
-                                                "然后点击下方按钮验证连通性。"
-                                            ),
-                                        },
-                                    }
-                                ],
-                            }
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VBtn",
-                                        "props": {
-                                            "color": "primary",
-                                            "variant": "tonal",
-                                            "prepend-icon": "mdi-send-check",
-                                            "onclick": (
-                                                "function(e) { window.MoviePilotAPI.post("
-                                                "'plugin/OneBotMsg/test', {}).then(function(r) {"
-                                                " alert((r && r.message) || '已发送') })"
-                                                ".catch(function(err) { console.error(err);"
-                                                " alert('发送失败，请查看日志') }) }"
-                                            ),
-                                        },
-                                        "text": "发送测试通知",
-                                    }
-                                ],
-                            }
-                        ],
-                    },
-                ],
-            }
-        ], {
+        transport_options = [
+            {"title": TRANSPORT_LABELS[TRANSPORT_HTTP] + "（默认，无需额外配置）",
+             "value": TRANSPORT_HTTP},
+            {"title": TRANSPORT_LABELS[TRANSPORT_WS] + "（需在 NapCat 开启 WS 服务器）",
+             "value": TRANSPORT_WS},
+        ]
+        style_options = [{"title": STYLE_LABELS[key], "value": key} for key in STYLE_LABELS]
+        image_options = [{"title": IMAGE_MODE_LABELS[key], "value": key}
+                         for key in IMAGE_MODE_LABELS]
+        send_mode_options = [{"title": SEND_MODE_LABELS[SEND_MODE_TEXT],
+                              "value": SEND_MODE_TEXT},
+                             {"title": SEND_MODE_LABELS[SEND_MODE_FORWARD],
+                              "value": SEND_MODE_FORWARD},
+                             {"title": "自动（明细多时用合并转发）", "value": "auto"}]
+
+        form: List[dict] = [{
+            "component": "VForm",
+            "content": [
+                self._section(
+                    "基础", "总开关与消息目标；目标里群号必须带前缀（群:/group:）",
+                    self._field("enabled", "启用插件", kind="VSwitch", md=4),
+                    self._field("api_url", "OneBot 地址",
+                                placeholder="http://127.0.0.1:3000",
+                                hint="NapCat 的 HTTP 或 WS 服务器地址", md=4),
+                    self._field("access_token", "Access Token",
+                                placeholder="与 NapCat 一致，未设置留空",
+                                field_type="password", md=4),
+                    self._field(
+                        "transport", "连接方式", kind="VSelect", items=transport_options,
+                        hint="WS 长连接可收到投递回执，且往返更快", md=4,
+                    ),
+                    self._field("targets", "默认推送目标", kind="VTextarea", rows=3, md=8,
+                                placeholder="123456789\n群:987654321",
+                                hint="裸数字按私聊；群号必须加 群: 或 group: 前缀"),
+                    self._field("user_targets", "用户定向推送（可选）", kind="VTextarea",
+                                rows=3, md=12,
+                                placeholder="admin=123456789\nalice=111111,群:222222",
+                                hint="按 MoviePilot 用户名定向，未命中回落默认目标"),
+                ),
+                self._section(
+                    "排版", "决定通知在 QQ 里长什么样",
+                    self._field("style", "排版样式", kind="VSelect", items=style_options,
+                                md=4),
+                    self._field("card_width", "卡片最大宽度（列）",
+                                placeholder=str(DEFAULT_MAX_WIDTH), field_type="number",
+                                min_value=20, md=4),
+                    self._field("title_prefix", "标题前缀", placeholder="例如 [MoviePilot]",
+                                md=4),
+                    self._field("send_mode", "发送方式", kind="VSelect",
+                                items=send_mode_options, md=4),
+                    self._field("forward_threshold", "自动转合并转发的明细行数",
+                                placeholder=str(_FORWARD_HINT_ROWS), field_type="number",
+                                md=4),
+                    self._field("max_length", "单条消息最大长度",
+                                placeholder=str(_DEFAULT_MAX_LENGTH), field_type="number",
+                                md=4),
+                    self._field("send_link", "附带链接", kind="VSwitch", md=3),
+                    self._field("at_in_group", "群消息 @ 用户", kind="VSwitch", md=3),
+                    self._field("react_on_success", "发送成功后贴表情回复",
+                                kind="VSwitch", md=3,
+                                hint="使用 NapCat set_msg_emoji_like，失败自动忽略"),
+                    self._field("send_image", "附带海报图片", kind="VSwitch", md=3),
+                ),
+                self._section(
+                    "图片", "图片发不出来时优先改这里：base64 内嵌不依赖网络可达性",
+                    self._field("image_mode", "图片发送方式", kind="VSelect",
+                                items=image_options, md=6),
+                    self._field("max_image_mb", "base64 体积上限（MB）",
+                                placeholder="3", field_type="number", min_value=0.1, md=6),
+                ),
+                self._section(
+                    "推送范围与稳定性", "控制推送哪些场景、以及发送节奏",
+                    self._field("msgtypes", "推送的消息类型", kind="VSelect",
+                                items=type_options, multiple=True, md=12,
+                                hint="未勾选任何场景时不推送通知"),
+                    self._field("dedupe_seconds", "去重时间窗口（秒）", placeholder="20",
+                                field_type="number", md=4),
+                    self._field("rate_limit", "每秒最大发送条数", placeholder="3",
+                                field_type="number", md=4),
+                    self._field("retries", "失败重试次数", placeholder="2",
+                                field_type="number", md=4),
+                ),
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VBtn",
+                                    "props": {
+                                        "color": "primary",
+                                        "variant": "tonal",
+                                        "prepend-icon": "mdi-send-check",
+                                        "onclick": (
+                                            "function(e) { window.MoviePilotAPI.post("
+                                            "'plugin/OneBotMsg/test', {}).then(function(r) {"
+                                            " alert((r && r.message) || '已发送') })"
+                                            ".catch(function(err) { console.error(err);"
+                                            " alert('发送失败，请查看日志') }) }"
+                                        ),
+                                    },
+                                    "text": "发送测试通知",
+                                }
+                            ],
+                        },
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VBtn",
+                                    "props": {
+                                        "color": "secondary",
+                                        "variant": "tonal",
+                                        "prepend-icon": "mdi-eye-outline",
+                                        "onclick": (
+                                            "function(e) { window.MoviePilotAPI.get("
+                                            "'plugin/OneBotMsg/preview').then(function(r) {"
+                                            " alert((r && r.message) || '无预览') })"
+                                            ".catch(function(err) { console.error(err);"
+                                            " alert('预览失败') }) }"
+                                        ),
+                                    },
+                                    "text": "预览排版效果",
+                                }
+                            ],
+                        },
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VBtn",
+                                    "props": {
+                                        "color": "info",
+                                        "variant": "tonal",
+                                        "prepend-icon": "mdi-access-point-check",
+                                        "onclick": (
+                                            "function(e) { window.MoviePilotAPI.get("
+                                            "'plugin/OneBotMsg/probe').then(function(r) {"
+                                            " alert((r && r.message) || '无结果') })"
+                                            ".catch(function(err) { console.error(err);"
+                                            " alert('探测失败') }) }"
+                                        ),
+                                    },
+                                    "text": "探测 NapCat 能力",
+                                }
+                            ],
+                        },
+                    ],
+                },
+                {
+                    "component": "VRow",
+                    "content": [
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12},
+                            "content": [
+                                {
+                                    "component": "VAlert",
+                                    "props": {
+                                        "type": "info",
+                                        "variant": "tonal",
+                                        "text": (
+                                            "连接方式：HTTP 正向接口最简单；正向 WebSocket "
+                                            "需要在 NapCat「网络配置」里开启 WebSocket 服务器，"
+                                            "地址可用同一端口的 ws:// 形式。图片发不出来时把"
+                                            "「图片发送方式」改为 base64 内嵌最稳。"
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ],
+        }]
+        return form, {
             "enabled": False,
             "api_url": "http://127.0.0.1:3000",
             "access_token": "",
+            "transport": TRANSPORT_HTTP,
             "targets": "",
             "user_targets": "",
             "msgtypes": list(_DEFAULT_TYPES),
+            "style": STYLE_CARD,
+            "card_width": DEFAULT_MAX_WIDTH,
+            "send_mode": SEND_MODE_TEXT,
+            "forward_threshold": _FORWARD_HINT_ROWS,
+            "title_prefix": "",
             "send_image": True,
+            "image_mode": IMAGE_MODE_AUTO,
+            "max_image_mb": 3,
             "send_link": True,
             "at_in_group": False,
-            "title_prefix": "",
+            "react_on_success": False,
             "max_length": _DEFAULT_MAX_LENGTH,
             "dedupe_seconds": 20,
             "rate_limit": 3,
             "retries": 2,
         }
+
+    def _preview_card(self) -> str:
+        """用示例数据渲染一张卡片，供配置页预览排版效果（不发送）。"""
+        sample = "\n".join([
+            "季集：S01E03",
+            "分类：电视剧/欧美剧",
+            "来源：themoviedb:1399",
+            "文件数：3",
+            "体积：2.41 GB",
+            "目标：/media/TV/Game of Thrones/Season 01",
+            "方式：link",
+        ])
+        return build_card(
+            emoji="✅",
+            title="整理入库 权力的游戏 (2011)",
+            text=sample,
+            link="http://moviepilot.local:3000/#/media",
+            style=self._style,
+            prefix=self._title_prefix,
+            max_width=self._card_width,
+            footer=time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+    def preview_layout(self, payload: Optional[dict] = None) -> PushResult:
+        """返回当前排版配置的渲染结果（含样式对照），不产生任何发送。"""
+        previews = []
+        for style in (STYLE_CARD, STYLE_COMPACT, STYLE_PLAIN):
+            card = build_card(
+                emoji="✅",
+                title="整理入库 权力的游戏 (2011)",
+                text="季集：S01E03\n分类：电视剧/欧美剧\n来源：themoviedb:1399",
+                link="http://moviepilot.local:3000/#/media",
+                style=style,
+                prefix=self._title_prefix,
+                max_width=self._card_width,
+            )
+            marker = " ← 当前配置" if style == self._style else ""
+            previews.append(f"【{STYLE_LABELS[style]}】{marker}\n{card}")
+        return PushResult(success=True,
+                          message="\n\n".join(previews),
+                          targets=0)
+
+    def probe_capabilities(self, payload: Optional[dict] = None) -> PushResult:
+        """探测 NapCat 版本与图片发送能力，用于排查"发不出去"。"""
+        if not self._api_url:
+            return PushResult(success=False, message="未配置 OneBot 地址")
+        probe = build_transport(
+            kind=self._transport_kind, url=self._api_url,
+            access_token=self._access_token, retries=0,
+        )
+        try:
+            report = probe_extensions(probe)
+        finally:
+            probe.close()
+        lines = [
+            f"连接方式：{TRANSPORT_LABELS.get(self._transport_kind, self._transport_kind)}",
+            f"地址：{self._api_url}",
+            f"NapCat 版本：{report.get('version') or '未知'}",
+            f"实现名称：{report.get('app_name') or '未知'}",
+            f"允许发送图片：{report.get('can_send_image')}",
+            f"图片发送方式：{IMAGE_MODE_LABELS.get(self._image_mode, self._image_mode)}",
+        ]
+        if report.get("version") is None:
+            lines.append("提示：未能取到版本信息，通常是地址/Token 不正确，或服务未启动。")
+        elif report.get("can_send_image") is False:
+            lines.append("提示：NapCat 报告当前账号不能发送图片，图片会被跳过。")
+        return PushResult(success=True, message="\n".join(lines), targets=0)
 
     def get_page(self) -> Optional[List[dict]]:
         """返回插件详情页面，展示运行状态与使用说明。"""
@@ -1512,11 +1937,37 @@ def _object_to_dict(value: Any) -> Dict[str, Any]:
     return result
 
 
-def _segment_text(segment: Dict[str, Any]) -> str:
-    """读取文本消息段的文本内容。"""
-    if isinstance(segment, dict) and segment.get("type") == "text":
-        return str((segment.get("data") or {}).get("text") or "")
-    return ""
+def _split_text(text: str, limit: int) -> List[str]:
+    """按长度上限切分长文本。
+
+    卡片是按行拼装的，直接按字符切会把边框切断、内容错位，因此这里优先按行边界
+    切分；单行本身超长时才硬切。
+    """
+    value = str(text or "")
+    if limit <= 0 or len(value) <= limit:
+        return [value] if value else []
+    chunks: List[str] = []
+    current: List[str] = []
+    current_len = 0
+    for line in value.split("\n"):
+        if len(line) > limit:
+            # 先结算已累积的行，再对超长行硬切。
+            if current:
+                chunks.append("\n".join(current))
+                current = []
+                current_len = 0
+            for offset in range(0, len(line), limit):
+                chunks.append(line[offset:offset + limit])
+            continue
+        if current and current_len + len(line) + 1 > limit:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += len(line) + 1
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
 
 
 def _unique(items: List[str]) -> List[str]:

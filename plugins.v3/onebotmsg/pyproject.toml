@@ -4,6 +4,6 @@ dynamic = ["version"]
 # V3 宿主运行时为 Python 3.14，仓库门禁（tests/ci/test_v3_dependency_manifests.py）
 # 要求此处与宿主保持一致。
 requires-python = ">=3.14"
-# 本插件只使用 Python 标准库（urllib/queue/threading）与宿主已提供的
-# pydantic、fastapi，因此不声明任何额外依赖，安装时不会触碰宿主依赖图。
+# 本插件只使用 Python 标准库（urllib / socket / queue / threading / base64）与宿主
+# 已提供的 pydantic、fastapi，因此不声明任何额外依赖，安装时不会触碰宿主依赖图。
 dependencies = []

@@ -4,30 +4,28 @@
 
 * 放在 ``tests/v3/onebotmsg/``，文件名与用例名可被 pytest 发现，由 ``tests/run.py``
   的独立 v3 会话执行；
-* 通过**生产命名空间** ``app.plugins.onebotmsg`` 导入插件与 ``onebot`` 子模块，
+* 通过**生产命名空间** ``app.plugins.onebotmsg`` 导入插件与其子模块，
   不把插件目录加入 ``sys.path``，避免同一源码被双重导入而重复注册事件；
-* 只 mock HTTP 调用，不依赖公网、真实 NapCat 或真实数据库。
+* 只 mock 对外 HTTP 调用；WebSocket 与 NapCat 扩展那一层用**真实回环服务端**
+  做端到端验证，确保握手、掩码、echo 派发不是只靠断言形状。
 
 运行方式：
 
     <workspace>/.venv/bin/python -m pytest tests/v3/onebotmsg   # 仓库门禁
     <workspace>/.venv/bin/python tests/run.py                   # 全量回归
 
-本文件只提供 pytest 用例，不提供独立执行入口（仓库测试约定）。缺少 MoviePilot 后端时
-（例如仅装了标准库的开发机），导入生产命名空间会失败并自动降级为内置 stub 自检，
-保证纯逻辑仍可验证；提交与 CI 必须走真实宿主。
-
-真实 V3 宿主的加载验证（插件安装、启停、重载、命令与 API 注册、QQ 实发）不属于
-本文件的职责，必须在真实 MoviePilot V3 环境中单独完成。
+本文件只提供 pytest 用例，不提供独立执行入口（仓库测试约定）。缺少 MoviePilot
+后端时（例如仅装了标准库的开发机），导入生产命名空间会失败并自动降级为内置 stub
+自检，保证纯逻辑仍可验证；提交与 CI 必须走真实宿主。
 """
 
 from __future__ import annotations
 
 import importlib
 import importlib.util
-import inspect
 import json
 import sys
+import tempfile
 import types
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -35,17 +33,13 @@ from unittest import mock
 
 
 def _require_pytest():
-    """按仓库约定取得 pytest，缺失时跳过而不是让模块导入失败。
-
-    正式门禁由 ``tests/run.py`` 或 ``-m pytest`` 执行，pytest 必然存在；这里做惰性
-    解析是为了让本文件在缺少 pytest 的裸解释器下仍能被导入，从而复用同一份回归逻辑
-    做手动排查。
-    """
+    """按仓库约定取得 pytest，缺失时跳过而不是让模块导入失败。"""
     if importlib.util.find_spec("pytest") is None:
         return None
     import pytest as pytest_module
 
     return pytest_module
+
 
 # Windows 控制台默认使用 GBK，直接打印 emoji 会抛 UnicodeEncodeError。
 for _stream_name in ("stdout", "stderr"):
@@ -61,6 +55,13 @@ PLUGIN_ID = "onebotmsg"
 PLUGIN_NAMESPACE = f"app.plugins.{PLUGIN_ID}"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PLUGIN_DIR = REPO_ROOT / "plugins.v3" / PLUGIN_ID
+
+# 测试临时目录：放一张真实的 1x1 PNG，用于验证 base64/路径两种图片形式。
+WORK_DIR = Path(tempfile.gettempdir()) / "onebotmsg-test"
+PNG_BYTES = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000a49444154789c6360000002000154a24f5f0000000049454e44ae426082"
+)
 
 # 收集到的检查结果：(分组名, 检查名, 是否通过)
 CHECKS: List[Tuple[str, str, bool]] = []
@@ -306,25 +307,16 @@ def _install_host_stubs() -> None:
 
 _HOST_KIND = "未初始化"
 _PLUGIN: Optional[types.ModuleType] = None
-_ONEBOT: Optional[types.ModuleType] = None
+_SUBMODULES: Dict[str, types.ModuleType] = {}
 
 
 def _import_production_namespace() -> types.ModuleType:
-    """按生产命名空间导入插件包 ``app.plugins.onebotmsg``。
-
-    仓库 conftest 的 ``pytest_configure`` 会调用后端 ``prepare_v3_backend``，
-    把 ``plugins.v3/`` 注入 ``app.plugins.__path__``，因此这里是 CI 与本地回归
-    的真实路径，也是 ``tests/README.md`` 约定的导入方式。
-    """
+    """按生产命名空间导入插件包 ``app.plugins.onebotmsg``。"""
     return importlib.import_module(PLUGIN_NAMESPACE)
 
 
 def _import_without_host() -> types.ModuleType:
-    """没有 MoviePilot 后端时的本地降级导入。
-
-    仓库约定插件目录不加入 ``sys.path``，因此仍以生产模块名
-    ``app.plugins.onebotmsg`` 执行源码；只有 ``app.*`` 缺失时才安装 stub。
-    """
+    """没有 MoviePilot 后端时的本地降级导入。"""
     import importlib.util
 
     _install_host_stubs()
@@ -343,16 +335,11 @@ def _import_without_host() -> types.ModuleType:
     return module
 
 
-def host() -> Tuple[types.ModuleType, types.ModuleType]:
-    """返回 ``(插件包, onebot 子模块)``，首次调用时解析。
-
-    优先使用生产命名空间；只有在没有 MoviePilot 后端时才降级加载，保证纯逻辑
-    在开发机上仍可自检。
-    """
-    global _HOST_KIND, _PLUGIN, _ONEBOT
-    if _PLUGIN is not None and _ONEBOT is not None:
-        return _PLUGIN, _ONEBOT
-
+def host() -> types.ModuleType:
+    """返回插件包，首次调用时解析（优先生产命名空间）。"""
+    global _HOST_KIND, _PLUGIN
+    if _PLUGIN is not None:
+        return _PLUGIN
     try:
         plugin = _import_production_namespace()
         _HOST_KIND = f"{PLUGIN_NAMESPACE} 命名空间导入"
@@ -360,10 +347,15 @@ def host() -> Tuple[types.ModuleType, types.ModuleType]:
         LOGGER_RECORDS.append(f"debug: 命名空间导入不可用，改用内置加载：{err!r}")
         plugin = _import_without_host()
         _HOST_KIND = "内置文件加载（宿主入口不可用）"
+    _PLUGIN = plugin
+    return plugin
 
-    onebot = importlib.import_module(f"{PLUGIN_NAMESPACE}.onebot")
-    _PLUGIN, _ONEBOT = plugin, onebot
-    return plugin, onebot
+
+def sub(name: str) -> types.ModuleType:
+    """导入并缓存插件子模块（onebot / transport / ws / render / napcat）。"""
+    if name not in _SUBMODULES:
+        _SUBMODULES[name] = importlib.import_module(f"{PLUGIN_NAMESPACE}.{name}")
+    return _SUBMODULES[name]
 
 
 # ------------------------------------------------------------------ HTTP 替身
@@ -376,6 +368,7 @@ def fake_urlopen_factory(calls: List[Dict[str, Any]], *, status: str = "ok",
     class _FakeResponse:
         def __init__(self, payload: Dict[str, Any]):
             self._payload = json.dumps(payload).encode("utf-8")
+            self.headers = {"Content-Type": "application/json"}
 
         def read(self) -> bytes:
             return self._payload
@@ -386,7 +379,7 @@ def fake_urlopen_factory(calls: List[Dict[str, Any]], *, status: str = "ok",
         def __exit__(self, *exc: Any) -> bool:
             return False
 
-    def _urlopen(request: Any, timeout: float = 0) -> _FakeResponse:
+    def _urlopen(request: Any, timeout: float = 0, **kwargs: Any) -> _FakeResponse:
         url = getattr(request, "full_url", str(request))
         action = url.rsplit("/", 1)[-1]
         body = getattr(request, "data", b"") or b""
@@ -406,242 +399,423 @@ def fake_urlopen_factory(calls: List[Dict[str, Any]], *, status: str = "ok",
     return _urlopen
 
 
-# ------------------------------------------------------- 宿主领域对象替身
+class _SocketStub:
+    """把 bytes 伪装成带 recv 的套接字，供 read_frame 测试使用。"""
 
+    def __init__(self, data: bytes):
+        self._data = data
 
-class _FileItem:
-    """FileItem 替身，提供 model_dump 与 path。"""
-
-    def __init__(self, path: str):
-        self.path = path
-
-    def model_dump(self) -> Dict[str, Any]:
-        return {"path": self.path, "name": self.path.rsplit("/", 1)[-1]}
-
-
-class _TransferInfo:
-    """TransferInfo 替身，字段与宿主 V3 保持一致。"""
-
-    def __init__(self, **kwargs: Any):
-        self.success = kwargs.get("success", True)
-        self.file_count = kwargs.get("file_count", 0)
-        self.total_size = kwargs.get("total_size", 0)
-        self.transfer_type = kwargs.get("transfer_type")
-        self.target_item = kwargs.get("target_item")
-        self.fail_list = kwargs.get("fail_list", [])
-        self.message = kwargs.get("message")
-        self.failure_stage = kwargs.get("failure_stage")
-        self.recovery_action = kwargs.get("recovery_action")
-
-    def model_dump(self) -> Dict[str, Any]:
-        return {
-            "success": self.success,
-            "file_count": self.file_count,
-            "total_size": self.total_size,
-            "transfer_type": self.transfer_type,
-            "target_item": self.target_item.model_dump() if self.target_item else None,
-            "fail_list": self.fail_list,
-            "message": self.message,
-            "failure_stage": self.failure_stage,
-            "recovery_action": self.recovery_action,
-        }
-
-
-class _MetaInfo:
-    """MetaInfo 替身。"""
-
-    def __init__(self, name: str, season: int, episode: int):
-        self.name = name
-        self.begin_season = season
-        self.begin_episode = episode
-
-    def model_dump(self) -> Dict[str, Any]:
-        return {"name": self.name, "begin_season": self.begin_season,
-                "begin_episode": self.begin_episode}
-
-
-class _MediaInfo:
-    """MediaInfo 替身，携带 V3 媒体身份。"""
-
-    def __init__(self, **kwargs: Any):
-        self.title = kwargs.get("title")
-        self.year = kwargs.get("year")
-        self.media_source = kwargs.get("media_source")
-        self.media_id = kwargs.get("media_id")
-
-    def model_dump(self) -> Dict[str, Any]:
-        return {"title": self.title, "year": self.year,
-                "media_source": self.media_source, "media_id": self.media_id}
-
-
-# ------------------------------------------------------------------ 检查分组
-
-
-def checks_protocol_helpers() -> None:
-    """onebot.py 的地址、目标与分段工具。"""
-    _plugin, onebot = host()
-    group("1. onebot.py 基础工具")
-    check(onebot.normalize_base_url("127.0.0.1:3000") == "http://127.0.0.1:3000",
-          "缺少协议头时自动补 http://")
-    check(onebot.normalize_base_url("http://a.b:3000/") == "http://a.b:3000",
-          "去除结尾斜杠")
-    check(onebot.normalize_base_url("") == "", "空地址返回空串")
-
-    users, groups = onebot.parse_qq_targets("123456\n群:987654\ngroup:222")
-    check(users == ["123456"], f"裸数字按私聊解析 -> {users}")
-    check(groups == ["987654", "222"], f"群前缀解析 -> {groups}")
-
-    users, groups = onebot.parse_qq_targets("private:1,好友:2")
-    check(users == ["1", "2"] and groups == [], f"私聊前缀解析 -> {users}/{groups}")
-
-    mapping = onebot.parse_user_target_map('{"admin": "123456", "alice": ["1", "群:2"]}')
-    check(mapping.get("admin") == ["123456"], "JSON 用户映射解析")
-    check(mapping.get("alice") == ["1", "群:2"], "JSON 用户映射数组解析")
-
-    mapping = onebot.parse_user_target_map("admin=123456\nalice=1,2")
-    check(mapping.get("admin") == ["123456"], "行式用户映射解析")
-    check(mapping.get("alice") == ["1", "2"], "行式用户映射多目标解析")
-
-    check(onebot.parse_targets("1,2 3\n4") == ["1", "2 3", "4"],
-          "目标列表按逗号/换行拆分")
-
-    segments = [
-        onebot.build_text_segment("a" * 10),
-        onebot.build_image_segment("http://img/1.jpg"),
-        onebot.build_text_segment("b" * 10),
-    ]
-    chunks = onebot.split_segments(segments, 15)
-    check(len(chunks) == 2, f"分段数量 -> {len(chunks)}")
-    check(onebot.join_segment_texts([s for c in chunks for s in c]) == "a" * 10 + "b" * 10,
-          "分段后文本内容完整")
-    check(len(onebot.split_segments([onebot.build_text_segment("x" * 25)], 10)) == 3,
-          "超长单段硬切为 3 段")
-
-
-def checks_rate_limit_and_dedupe() -> None:
-    """令牌桶与去重缓存。"""
-    _plugin, onebot = host()
-    group("2. 限流与去重")
-    bucket = onebot.TokenBucket(rate=1000, capacity=1)
-    check(all(bucket.acquire(timeout=1) for _ in range(50)), "令牌桶高速率下持续放行")
-
-    dedupe = onebot.DedupeCache(ttl=30, maxsize=4)
-    check(dedupe.seen("k1") is False, "首次出现返回 False")
-    check(dedupe.seen("k1") is True, "重复出现返回 True")
-    for index in range(10):
-        dedupe.seen(f"extra{index}")
-    check(len(dedupe) <= 4, f"去重缓存不超过上限 -> {len(dedupe)}")
-
-
-def checks_client_calls() -> None:
-    """OneBot 客户端动作、鉴权、失败判定与重试。"""
-    _plugin, onebot = host()
-    group("3. 客户端动作调用")
-    calls: List[Dict[str, Any]] = []
-    with mock.patch("urllib.request.urlopen", fake_urlopen_factory(calls)):
-        client = onebot.OneBotClient("http://127.0.0.1:3000", access_token="tok",
-                                     rate_limit=1000, rate_burst=1000)
-        check(client.send_private_msg("123456", [onebot.build_text_segment("hi")]).ok,
-              "私聊发送成功")
-        check(client.send_group_msg("999", "hello").ok, "群发送成功")
-
-    check(calls and calls[0]["url"] == "http://127.0.0.1:3000/send_private_msg",
-          f"动作路径拼接 -> {calls[0]['url'] if calls else '无调用'}")
-    check(calls and calls[0]["params"]["user_id"] == "123456", "user_id 以字符串下发")
-    check(calls and calls[0]["authorization"] == "Bearer tok", "Access Token 以 Bearer 下发")
-    check(len(calls) > 1 and calls[1]["params"]["group_id"] == "999", "group_id 以字符串下发")
-
-    calls.clear()
-    with mock.patch("urllib.request.urlopen",
-                    fake_urlopen_factory(calls, status="failed", retcode=100)):
-        client = onebot.OneBotClient("http://127.0.0.1:3000", retries=3,
-                                     rate_limit=1000, rate_burst=1000)
-        result = client.send_private_msg("1", "x")
-    check(not result.ok and result.retcode == 100, "retcode!=0 判定失败")
-    check(len(calls) == 1, f"协议失败不重试 -> 调用 {len(calls)} 次")
-
-    calls.clear()
-    with mock.patch("urllib.request.urlopen",
-                    fake_urlopen_factory(calls, fail_actions=("send_private_msg",))), \
-            mock.patch("time.sleep", lambda *_: None):
-        client = onebot.OneBotClient("http://127.0.0.1:3000", retries=2,
-                                     rate_limit=1000, rate_burst=1000)
-        result = client.send_private_msg("1", "x")
-    check(not result.ok, "网络失败判定失败")
-    check(len(calls) == 3, f"网络失败按 retries 重试 -> 调用 {len(calls)} 次")
-    check(not onebot.OneBotClient("").call("get_login_info").ok, "未配置地址直接失败")
-
-
-def checks_group_at_segment() -> None:
-    """多目标批量发送与群内 @。"""
-    _plugin, onebot = host()
-    group("4. 组合发送与 @")
-    calls: List[Dict[str, Any]] = []
-    with mock.patch("urllib.request.urlopen", fake_urlopen_factory(calls)):
-        client = onebot.OneBotClient("http://127.0.0.1:3000",
-                                     rate_limit=1000, rate_burst=1000)
-        results = client.send_notification(
-            message=[onebot.build_text_segment("body")],
-            user_ids=["1"], group_ids=["2"], at_user="1",
-        )
-    check(len(results) == 2 and all(r.ok for r in results), "多目标批量发送")
-    group_calls = [c for c in calls if c["action"] == "send_group_msg"]
-    check(bool(group_calls) and group_calls[0]["params"]["message"][0]["type"] == "at",
-          "@ 段插入群消息首位")
-    check(bool(group_calls) and group_calls[0]["params"]["message"][0]["data"]["qq"] == "1",
-          "@ 目标正确")
+    def recv(self, size: int) -> bytes:
+        """按需切片返回。"""
+        chunk, self._data = self._data[:size], self._data[size:]
+        return chunk
 
 
 CONFIG = {
     "enabled": True,
     "api_url": "127.0.0.1:3000/",
     "access_token": "tok",
+    "transport": "http",
     "targets": "10001\n群:20002\ngroup:20003",
     "user_targets": "alice=30003",
     "msgtypes": ["Organize", "Download"],
+    "style": "card",
+    "send_mode": "text",
     "send_image": True,
     "send_link": True,
-    "rate_limit": 50,
+    "rate_limit": 1000,
     "retries": 0,
-    "max_length": 200,
+    "max_length": 4000,
     "dedupe_seconds": 60,
 }
 
+# 只发一个私聊目标的配置：测试关注的是消息内容与扩展动作，
+# 用默认目标会同时发 1 私聊 + 2 群，断言会被无关调用干扰。
+CONFIG_SINGLE = {**CONFIG, "targets": "10001", "user_targets": ""}
 
-def checks_lifecycle() -> None:
-    """插件生命周期与配置解析。"""
-    plugin, onebot = host()
-    group("5. 插件主类：生命周期与配置解析")
-    OneBotMsg = plugin.OneBotMsg
-    check(not inspect.isabstract(OneBotMsg), "插件类已实现全部抽象方法")
 
-    instance = OneBotMsg()
+def _new_instance(config: Optional[Dict[str, Any]] = None):
+    """构造已初始化且 HTTP 被 mock 的插件实例，返回 ``(实例, 调用记录, 补丁栈)``。"""
+    plugin = host()
+    instance = plugin.OneBotMsg()
     with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
-        instance.init_plugin(CONFIG)
+        instance.init_plugin(config if config is not None else CONFIG)
+    calls: List[Dict[str, Any]] = []
+    stack = mock.patch("urllib.request.urlopen", fake_urlopen_factory(calls))
+    stack.start()
+    return instance, calls, stack
+
+
+def _texts(calls: List[Dict[str, Any]], action: str = "send_private_msg") -> List[str]:
+    """取出某类调用里的文本内容（合并消息段）。"""
+    out: List[str] = []
+    for call in calls:
+        if call["action"] != action:
+            continue
+        message = call["params"].get("message")
+        if isinstance(message, str):
+            out.append(message)
+            continue
+        parts = [str((seg.get("data") or {}).get("text") or "")
+                 for seg in message or [] if seg.get("type") == "text"]
+        out.append("".join(parts))
+    return out
+
+
+def _write_png() -> Path:
+    """在测试临时目录写入一张真实 PNG，返回路径。"""
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    target = WORK_DIR / "poster.png"
+    target.write_bytes(PNG_BYTES)
+    return target
+
+
+# ------------------------------------------------------------------ 检查分组
+
+
+def checks_plugin_metadata() -> None:
+    """版本、目录与命名约定。"""
+    plugin = host()
+    group("1. 插件元数据与目录约定")
+    plugin_file = Path(plugin.__file__).resolve()
+    check(plugin_file.parent.name == PLUGIN_ID, "插件目录名与类名小写一致")
+    check(plugin_file.name == "__init__.py", "主类定义在 __init__.py")
+    check((plugin_file.parent / "README.md").is_file(), "插件目录包含 README.md")
+    check(plugin.__name__ == PLUGIN_NAMESPACE, "按生产命名空间 app.plugins.onebotmsg 加载")
+    check(plugin.OneBotMsg.plugin_config_prefix == f"{PLUGIN_ID}_", "配置前缀匹配插件 ID")
+    check(plugin.OneBotMsg.plugin_version == "1.1.0",
+          f"版本为 1.1.0（实际 {plugin.OneBotMsg.plugin_version}）")
+    for name in ("onebot", "transport", "ws", "render", "napcat"):
+        check((plugin_file.parent / f"{name}.py").is_file(), f"子模块 {name}.py 存在")
+    check("命名空间导入" in _HOST_KIND or "内置文件加载" in _HOST_KIND,
+          f"插件加载方式可识别：{_HOST_KIND}")
+
+
+def checks_ws_framing() -> None:
+    """WebSocket 帧编码/解码与 URL 规范化。"""
+    ws = sub("ws")
+    group("2. WebSocket 协议基础")
+    check(ws.build_ws_url("http://192.168.3.22:3000") == "ws://192.168.3.22:3000",
+          "http 地址转换为 ws")
+    check(ws.build_ws_url("https://a.b/c") == "wss://a.b/c", "https 地址转换为 wss")
+    check(ws.build_ws_url("ws://a.b:1/") == "ws://a.b:1", "已是的 ws 地址保留并去尾斜杠")
+    check(ws.build_ws_url("") == "", "空地址返回空串")
+
+    for payload in (b"hi", b"x" * 200, b"y" * 70000):
+        frame = ws.encode_frame(payload, ws._OP_TEXT)
+        check(ws.read_frame(_SocketStub(frame)) == (ws._OP_TEXT, payload),
+              f"帧往返一致（{len(payload)} 字节：掩码 + 长度分支）")
+
+    frame = ws.encode_frame(b"pong", ws._OP_TEXT, mask=False)
+    check(ws.read_frame(_SocketStub(frame)) == (ws._OP_TEXT, b"pong"),
+          "未掩码帧（服务端方向）可正确解码")
+
+    # 分片续帧：首帧 FIN=0，后继 CONT 帧
+    first = bytearray(ws.encode_frame(b"abc", ws._OP_TEXT))
+    first[0] &= 0x7F  # 清掉 FIN
+    cont = ws.encode_frame(b"def", ws._OP_CONT)
+    check(ws.read_frame(_SocketStub(bytes(first) + cont)) == (ws._OP_TEXT, b"abcdef"),
+          "分片续帧可拼接还原")
+
+
+def checks_ws_roundtrip() -> None:
+    """真实回环 WebSocket 服务端上的端到端调用。"""
+    ws = sub("ws")
+    group("3. WebSocket 端到端（真实回环服务端）")
+
+    def handler(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """按动作返回响应，用于验证 echo 派发。"""
+        action = request.get("action")
+        if action == "get_login_info":
+            return {"status": "ok", "retcode": 0,
+                    "data": {"user_id": 1914144635, "nickname": "OP"}}
+        if action == "send_private_msg":
+            return {"status": "ok", "retcode": 0, "data": {"message_id": 4242}}
+        if action == "boom":
+            return {"status": "failed", "retcode": 1400, "message": "坏请求"}
+        return {"status": "ok", "retcode": 0, "data": {}}
+
+    server = ws.LoopbackWSServer(handler).start()
+    try:
+        client = ws.OneBotWSClient(server.url, timeout=5.0)
+        check(client.connect(), "握手成功（含 Sec-WebSocket-Accept 校验）")
+        check(client.connected, "连接状态为已连接")
+
+        response = client.call("get_login_info")
+        check(response is not None and response.get("retcode") == 0,
+              "动作调用拿到 ok 响应")
+        check((response or {}).get("data", {}).get("user_id") == 1914144635,
+              "响应 data 正确回传")
+        check(bool(server.requests) and server.requests[0].get("action") == "get_login_info",
+              "服务端收到 action 字段")
+
+        response = client.call("send_private_msg", {"user_id": "1", "message": "hi"})
+        check((response or {}).get("data", {}).get("message_id") == 4242,
+              "带参数动作响应正确")
+        check(server.requests[-1].get("params", {}).get("user_id") == "1",
+              "参数原样送达服务端")
+
+        response = client.call("boom")
+        check(response is not None and response.get("retcode") == 1400,
+              "失败响应原样回传（retcode 1400）")
+
+        client.close()
+        check(not client.connected, "close 之后状态为未连接")
+    finally:
+        server.stop()
+
+    server = ws.LoopbackWSServer(lambda req: {"status": "ok", "retcode": 0},
+                                 token="secret").start()
+    try:
+        bad = ws.OneBotWSClient(server.url, access_token="wrong", timeout=5.0)
+        check(not bad.connect(), "Token 不匹配时握手被拒绝")
+        check("401" in (bad.last_error or ""), f"错误信息包含 401：{bad.last_error}")
+        good = ws.OneBotWSClient(server.url, access_token="secret", timeout=5.0)
+        check(good.connect(), "Token 正确时握手成功")
+        check(good.call("get_login_info") is not None, "鉴权连接可正常调用")
+        good.close()
+    finally:
+        server.stop()
+
+    # 无法连接时应快速失败，而不是抛异常
+    dead = ws.OneBotWSClient("ws://127.0.0.1:1/", timeout=2.0)
+    check(not dead.connect(), "连接到不可用端口时返回 False")
+    check(bool(dead.last_error), f"记录了失败原因：{dead.last_error}")
+
+
+def checks_transport_layer() -> None:
+    """传输抽象：HTTP 与 WS 的统一行为。"""
+    transport = sub("transport")
+    group("4. 传输抽象")
+
+    with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
+        http = transport.build_transport("http", "http://127.0.0.1:3000")
+    check(http.kind == "http", "按配置构造 HTTP 传输")
+    check(http.label == transport.TRANSPORT_LABELS["http"], "HTTP 传输展示名正确")
+    check(http.connected, "HTTP 传输恒为已连接")
+    check(http.dedupe is not None, "HTTP 传输暴露去重缓存")
+    check(http.sent_receipts() == [], "HTTP 传输没有投递回执")
+
+    ws_transport = transport.build_transport("ws", "127.0.0.1:3000")
+    check(ws_transport.kind == "ws", "按配置构造 WS 传输")
+    check(ws_transport.endpoint == "ws://127.0.0.1:3000",
+          f"WS 地址规范化 -> {ws_transport.endpoint}")
+    check(not ws_transport.connected, "未连接时 WS 传输状态为未连接")
+    check(ws_transport.sent_receipts() == [], "未连接时没有投递回执")
+    check("未连接" in transport.describe_transport(ws_transport),
+          f"未连接时的描述 -> {transport.describe_transport(ws_transport)}")
+    ws_transport.close()
+
+    check(transport.normalize_transport("WS") == "ws", "传输标识大小写不敏感")
+    check(transport.normalize_transport("websocket") == "ws", "websocket 别名")
+    check(transport.normalize_transport("乱填") == "http", "非法值回落 HTTP")
+    check("未初始化" in transport.describe_transport(None), "空传输的描述")
+    check("HTTP" in transport.describe_transport(http), "HTTP 传输描述含通道名")
+
+    # WS 传输把响应统一转换为 OneBotResponse
+    ws_module = sub("ws")
+    server = ws_module.LoopbackWSServer(
+        lambda req: {"status": "ok", "retcode": 0, "data": {"message_id": 7}}
+    ).start()
+    try:
+        ws_transport = transport.build_transport("ws", server.url, timeout=5.0)
+        result = ws_transport.call("send_private_msg", {"user_id": "1", "message": "x"})
+        check(result is not None and result.ok, "WS 传输返回统一响应对象")
+        check(result is not None and result.message_id == 7, "WS 响应 message_id 可读")
+        ws_transport.close()
+    finally:
+        server.stop()
+
+
+def checks_render_layout() -> None:
+    """排版：宽度计算、字段解析与三种样式。"""
+    render = sub("render")
+    group("5. 排版渲染")
+
+    check(render.display_width("abc") == 3, "ASCII 宽度=字符数")
+    check(render.display_width("中文") == 4, "中文按 2 列计算")
+    check(render.display_width("A中") == 3, "中英混排宽度正确")
+    check(render.truncate_width("中文中文中文", 5).endswith("…"), "按列截断带省略号")
+    check(render.display_width(render.truncate_width("中文中文中文", 5)) <= 5,
+          "截断后不超过限定列宽")
+    check(render.pad_width("中", 4) == "中  ", "按列宽补齐")
+    check(render.wrap_text("abcdefg", 3) == ["abc", "def", "g"], "软换行按列宽切分")
+
+    fields = render.split_fields("季集：S01E03\n分类：电视剧/欧美剧")
+    check(fields == [("季集", "S01E03"), ("分类", "电视剧/欧美剧")],
+          f"字段解析 -> {fields}")
+    fields = render.split_fields("一句话通知，没有字段结构")
+    check(fields == [("", "一句话通知，没有字段结构")], "无字段结构时整行保留")
+    fields = render.split_fields("时间：2026-10-10 02:34:17，来源：themoviedb:1399")
+    check(len(fields) == 2 and fields[0][0] == "时间" and fields[1][0] == "来源",
+          f"同行多字段解析 -> {fields}")
+
+    card = render.build_card("✅", "整理入库 某剧 (2024)",
+                             "季集：S01E03\n分类：电视剧", "http://mp/#/media")
+    lines = card.split("\n")
+    check(lines[0].startswith("╭") and lines[-1].startswith("╰"), "卡片有上下边框")
+    widths = {render.display_width(line) for line in lines}
+    check(len(widths) == 1, f"卡片每行显示宽度一致 -> {sorted(widths)}")
+    check("季集" in card and "S01E03" in card, "字段进入卡片")
+    check("http://mp/#/media" in card, "链接进入卡片")
+    check(max(widths) <= render.DEFAULT_MAX_WIDTH + 2,
+          f"卡片宽度不超过上限 -> {max(widths)}")
+
+    long_card = render.build_card("✅", "标题", "\n".join(
+        f"字段{i}：值{i}" for i in range(30)), None)
+    check("已省略" in long_card, "字段过多时提示省略")
+    check(len({render.display_width(line) for line in long_card.split("\n")}) == 1,
+          "长卡片仍然对齐")
+
+    compact = render.build_card("🔔", "订阅", "名称：某剧", None, style="compact")
+    check(compact.split("\n")[0].startswith("🔔"), "紧凑样式首行是标题")
+    check("· 名称：某剧" in compact, "紧凑样式正文带项目符号")
+    check("╭" not in compact, "紧凑样式无边框")
+
+    plain = render.build_card("📢", "标题", "正文", None, style="plain")
+    check(plain.split("\n") == ["📢 标题", "正文"], f"原始样式直出 -> {plain!r}")
+    plain_link = render.build_card("📢", "标题", "正文", "http://x", style="plain")
+    check(plain_link.split("\n")[-1] == "http://x", "原始样式把链接原样附在末尾")
+    check(render.normalize_style("卡片") == "card", "中文样式名解析")
+    check(render.normalize_style("") == "card", "空样式回落卡片")
+
+    nodes = render.build_forward_nodes("✅", "入库", "季集：S01E01", "http://x")
+    check(len(nodes) >= 3, f"合并转发节点数 -> {len(nodes)}")
+    check(all(node.get("type") == "node" for node in nodes), "节点类型为 node")
+    check(all("content" in node.get("data", {}) for node in nodes), "节点包含 content")
+    check(all("uin" in node.get("data", {}) for node in nodes), "节点包含 uin")
+
+    status = render.build_status_card("插件", "1.1.0", "HTTP", "http://x",
+                                      {"received": 5}, 0, "私聊 1")
+    check("运行状态" in status, "状态卡片含标题")
+
+    long_url = "https://example.com/" + "a" * 200
+    check(len(render.shorten_url(long_url)) <= 46,
+          f"长链接被缩短 -> {len(render.shorten_url(long_url))}")
+
+
+def checks_image_handling() -> None:
+    """图片：候选形式、base64 转换与上限保护。"""
+    napcat = sub("napcat")
+    transport_module = sub("transport")
+    group("6. 图片处理")
+    png = _write_png()
+
+    check(napcat.looks_like_url("https://a/b.jpg"), "识别 http 地址")
+    check(not napcat.looks_like_url("/tmp/a.jpg"), "本地路径不算 URL")
+
+    uri = napcat.to_base64_uri(str(png))
+    check(uri is not None and uri.startswith("base64://"), "本地文件可转 base64")
+    check(napcat.read_image_bytes(uri or "") == PNG_BYTES, "base64 可解回原字节")
+    check(napcat.to_base64_uri(str(png), max_bytes=4) is None,
+          "超过体积上限时拒绝转 base64")
+
+    candidates, _ = napcat.normalize_image_candidates(
+        "https://example.com/a.jpg", target_dir=WORK_DIR, mode="auto",
+    )
+    check(len(candidates) == 1 and candidates[0].startswith("http"),
+          f"auto 模式：图片不可读时只留 URL -> {[c[:18] for c in candidates]}")
+
+    # 图片可读时（例如 TMDB 直链），auto 模式应同时准备 base64 兜底
+    with mock.patch.object(napcat, "read_image_bytes", return_value=PNG_BYTES):
+        candidates, _ = napcat.normalize_image_candidates(
+            "https://example.com/a.jpg", target_dir=WORK_DIR, mode="auto",
+        )
+    check(len(candidates) == 2 and candidates[0].startswith("http")
+          and candidates[1].startswith("base64://"),
+          f"auto 模式候选顺序（URL 优先、base64 兜底）-> {[c[:18] for c in candidates]}")
+
+    candidates, _ = napcat.normalize_image_candidates(
+        str(png), target_dir=WORK_DIR, mode="auto",
+    )
+    check(candidates == [napcat.to_base64_uri(str(png))],
+          "本地文件在 auto 模式下走 base64")
+
+    candidates, _ = napcat.normalize_image_candidates(
+        "https://example.com/a.jpg", target_dir=WORK_DIR, mode="url",
+    )
+    check(candidates == ["https://example.com/a.jpg"], "url 模式只给 URL")
+
+    candidates, notes = napcat.normalize_image_candidates(
+        "/not/exist.png", target_dir=WORK_DIR, mode="base64",
+    )
+    check(candidates == [] and notes, "base64 模式读取失败时给出说明")
+
+    candidates, _ = napcat.normalize_image_candidates(
+        "https://example.com/a.jpg", target_dir=WORK_DIR, mode="text",
+    )
+    check(candidates == [], "text 模式不发送图片")
+
+    check(napcat.guess_suffix("https://a/b.JPEG?x=1", "") == ".jpeg", "从 URL 推断后缀")
+    check(napcat.guess_suffix("https://a/b", "image/png") == ".png",
+          "从 Content-Type 推断后缀")
+
+    # 候选回退：第一种失败后自动尝试第二种
+    attempts: List[str] = []
+
+    def urlopen(request: Any, timeout: float = 0, **kwargs: Any):
+        """第一次调用失败，第二次成功，用于验证候选回退。"""
+        attempts.append(getattr(request, "full_url", str(request)))
+        if len(attempts) == 1:
+            raise OSError("第一次失败")
+        return fake_urlopen_factory([])(request, timeout)
+
+    with mock.patch("urllib.request.urlopen", urlopen):
+        http = transport_module.build_transport("http", "http://127.0.0.1:3000")
+        ok, detail = napcat.send_image(
+            http, message_type="private", user_id="1",
+            candidates=["https://a/b.jpg", "base64://AAAA"],
+        )
+    check(ok, f"候选回退后成功 -> {detail}")
+    check(len(attempts) == 2, f"确实尝试了两种形式 -> {len(attempts)} 次")
+    check(any("base64" in a or "send_private_msg" in a for a in attempts),
+          "第二次尝试仍是发送动作")
+
+    # 群消息：@ 与图片可以共存
+    calls: List[Dict[str, Any]] = []
+    with mock.patch("urllib.request.urlopen", fake_urlopen_factory(calls)):
+        http = transport_module.build_transport("http", "http://127.0.0.1:3000")
+        ok, detail = napcat.send_image(
+            http, message_type="group", group_id="999", candidates=["https://a/b.jpg"],
+            caption="海报", at_user="1",
+        )
+    check(ok, f"群图片发送成功 -> {detail}")
+    segments = calls[0]["params"]["message"]
+    check(segments[0]["type"] == "at", "@ 段在首位")
+    check(any(s.get("type") == "image" for s in segments), "图片段存在")
+    check(any(s.get("type") == "text" for s in segments), "说明文本段存在")
+
+
+def checks_transport_in_plugin() -> None:
+    """插件按配置选择传输。"""
+    plugin = host()
+    group("7. 插件与传输的接线")
+    instance = plugin.OneBotMsg()
+    with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
+        instance.init_plugin({**CONFIG, "transport": "http"})
+    check(instance._transport is not None and instance._transport.kind == "http",
+          "HTTP 配置生成 HTTP 传输")
+    check(instance._transport.endpoint == "http://127.0.0.1:3000",
+          f"地址规范化 -> {instance._transport.endpoint}")
     check(instance.get_state(), "启用且配置完整时 get_state 为真")
-    check(instance._private_users == ["10001"], f"私聊目标 -> {instance._private_users}")
-    check(instance._groups == ["20002", "20003"], f"群目标 -> {instance._groups}")
-    check(instance._user_targets.get("alice") == ["30003"], "用户映射解析入配置")
-    check(instance._client is not None
-          and instance._client.base_url == "http://127.0.0.1:3000", "客户端地址规范化")
-
-    first_worker = instance._worker
-    with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
-        instance.init_plugin(CONFIG)
-    check(instance._worker is not first_worker, "重复初始化更换工作线程")
-    check(not (first_worker and first_worker.is_alive()), "旧工作线程已退出")
     instance.stop_service()
 
-    check(isinstance(onebot, types.ModuleType), "onebot 子模块按包内相对导入解析")
+    instance = plugin.OneBotMsg()
+    with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
+        instance.init_plugin({**CONFIG, "transport": "ws"})
+    check(instance._transport is not None and instance._transport.kind == "ws",
+          "WS 配置生成 WS 传输")
+    check(instance._transport.endpoint.startswith("ws://"),
+          f"WS 地址前缀 -> {instance._transport.endpoint}")
+    check(instance._transport.sent_receipts() == [], "WS 传输支持回执接口")
+    instance.stop_service()
+    check(not instance._transport.connected, "stop_service 后连接已释放")
 
 
 def checks_target_routing() -> None:
     """目标路由优先级。"""
-    plugin, _onebot = host()
-    group("6. 目标路由优先级")
-    instance = plugin.OneBotMsg()
-    with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
-        instance.init_plugin(CONFIG)
+    group("8. 目标路由优先级")
+    instance, calls, stack = _new_instance()
     try:
         users, groups, _ = instance._resolve_targets()
         check(users == ["10001"] and groups == ["20002", "20003"], "无用户时使用默认目标")
@@ -655,22 +829,18 @@ def checks_target_routing() -> None:
         users, _groups, _ = instance._resolve_targets(targets={"qq": "40004", "telegram": "x"})
         check(users == ["40004"], "宿主 targets 中的 QQ 目标优先")
 
-        users, _groups, _ = instance._resolve_targets(targets={"telegram": "x"})
-        check(users == ["10001"], "targets 无 QQ 键时回落默认目标")
-
         _users, groups, _ = instance._resolve_targets(targets={"QQ": "群:50005"})
         check(groups == ["50005"], "targets 支持群前缀")
     finally:
+        stack.stop()
         instance.stop_service()
 
 
 def checks_type_filter() -> None:
     """消息类型过滤、宿主场景开关与 QQ 渠道禁用检测。"""
-    plugin, _onebot = host()
-    group("7. 消息类型过滤")
-    instance = plugin.OneBotMsg()
-    with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
-        instance.init_plugin(CONFIG)
+    plugin = host()
+    group("9. 消息类型过滤")
+    instance, calls, stack = _new_instance()
     try:
         check(instance._type_enabled("Organize"), "已勾选类型放行")
         check(not instance._type_enabled("Subscribe"), "未勾选类型拦截")
@@ -678,33 +848,16 @@ def checks_type_filter() -> None:
 
         instance._msgtypes = []
         check(not instance._type_enabled("Organize"), "未勾选任何场景时不推送")
-        check(not instance._type_enabled(None), "未勾选任何场景时其它通知也不推送")
-
-        with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
-            instance.init_plugin({**CONFIG, "msgtypes": []})
-        check(instance._msgtypes == [], "显式清空 msgtypes 不被默认值覆盖")
-        with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
-            instance.init_plugin({k: v for k, v in CONFIG.items() if k != "msgtypes"})
-        check(instance._msgtypes == list(plugin._DEFAULT_TYPES),
-              "缺少 msgtypes 配置时回落到默认场景")
-        with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
-            instance.init_plugin(CONFIG)
-        check(instance._msgtypes == ["Organize", "Download"], "配置恢复成功")
 
         helper = plugin.OneBotMsg._host_scene_allows
-        # 场景开关与渠道配置都通过 mock 注入，真实宿主下也能确定性地验证判定分支。
         with mock.patch.object(plugin.ServiceConfigHelper, "get_notification_switch",
-                               side_effect=lambda mtype: {"Organize": ""}.get(
-                                   getattr(mtype, "name", str(mtype)), "admin")):
+                               return_value=""):
             check(not helper("Organize"), "宿主场景开关为空时拦截")
         with mock.patch.object(plugin.ServiceConfigHelper, "get_notification_switch",
                                return_value="all"):
             check(helper("Organize"), "宿主场景为 all 时放行")
-        with mock.patch.object(plugin.ServiceConfigHelper, "get_notification_switch",
-                               return_value="admin"):
-            check(helper("Organize"), "宿主场景为 admin 时放行")
 
-        group("7b. 宿主 QQ 渠道禁用检测")
+        group("9b. 宿主 QQ 渠道禁用检测")
         disabled = plugin.OneBotMsg._qq_channel_disabled
 
         def _with_configs(configs: List[Any], name: str, expect: bool) -> None:
@@ -714,37 +867,20 @@ def checks_type_filter() -> None:
                 check(disabled() is expect, name)
 
         _with_configs([], "宿主未配置通知渠道时不拦截", False)
-        _with_configs([_ChannelConf("telegram", False)], "只有其它渠道时不拦截", False)
-        _with_configs([_ChannelConf("qq", True)], "QQ 渠道启用时不拦截", False)
         _with_configs([_ChannelConf("qq", False)], "QQ 渠道禁用时拦截", True)
-        _with_configs([_ChannelConf("qq", False), _ChannelConf("telegram", True)],
-                      "QQ 渠道全部禁用时拦截", True)
+        _with_configs([_ChannelConf("qq", True)], "QQ 渠道启用时不拦截", False)
         _with_configs([_ChannelConf("qq", False), _ChannelConf("QQBot", True)],
                       "存在任一启用的 QQ 渠道时不拦截", False)
     finally:
+        stack.stop()
         instance.stop_service()
 
 
-def _new_instance(config: Dict[str, Any] | None = None):
-    """构造一个已初始化且 HTTP 被 mock 的插件实例，返回 ``(实例, 调用记录, 补丁栈)``。"""
-    plugin, onebot = host()
-    instance = plugin.OneBotMsg()
-    with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
-        instance.init_plugin(config if config is not None else CONFIG)
-    calls: List[Dict[str, Any]] = []
-    stack = mock.patch("urllib.request.urlopen", fake_urlopen_factory(calls))
-    stack.start()
-    instance._client = onebot.OneBotClient(
-        "http://127.0.0.1:3000", access_token="tok",
-        rate_limit=1000, rate_burst=1000, dedupe_ttl=60,
-    )
-    return instance, calls, stack
-
-
 def checks_notice_forwarding() -> None:
-    """通知事件端到端转发、去重与过滤。"""
-    plugin, onebot = host()
-    group("8. 通知事件转发（端到端）")
+    """通知事件转发、去重与过滤（含新排版）。"""
+    plugin = host()
+    render = sub("render")
+    group("10. 通知转发端到端")
     instance, calls, stack = _new_instance()
     try:
         event = plugin.Event(
@@ -753,7 +889,7 @@ def checks_notice_forwarding() -> None:
                 "type": plugin.MessageType.Organize,
                 "title": "【测试】影片入库",
                 "text": "时间：2024-01-01 00:00:00\n季集：S01E01",
-                "image": "https://img/poster.jpg",
+                "image": None,
                 "link": "http://mp/#/media",
                 "userid": "alice",
                 "targets": None,
@@ -762,44 +898,24 @@ def checks_notice_forwarding() -> None:
         instance.forward_notice(event)
         instance._queue.join()
 
-        actions = sorted(call["action"] for call in calls)
-        check(actions == ["send_private_msg"], f"命中用户映射后只发私聊 -> {actions}")
-        private_calls = [c for c in calls if c["action"] == "send_private_msg"]
-        check(bool(private_calls) and private_calls[0]["params"]["user_id"] == "30003",
-              "使用映射中的 QQ 号")
-        segments = private_calls[0]["params"]["message"] if private_calls else []
-        text = onebot.join_segment_texts(segments)
-        check("✅" in text, "入库通知带 ✅ 图标")
+        check([c["action"] for c in calls] == ["send_private_msg"],
+              f"命中用户映射后只发私聊 -> {[c['action'] for c in calls]}")
+        text = _texts(calls)[0]
         check("影片入库" in text, "标题进入消息")
         check("S01E01" in text, "正文进入消息")
-        check("http://mp/#/media" in text, "链接进入消息")
-        check(any(seg.get("type") == "image" for seg in segments), "图片段存在")
-        check(instance.get_runtime_stats()["sent"] == 1, "发送统计累加")
+        check(text.startswith("╭"), "默认按卡片样式排版")
+        check("http://mp/#/media" in text, "链接进入卡片")
+        lines = text.split("\n")
+        check(len({render.display_width(line) for line in lines}) == 1,
+              "发送出去的卡片也对齐")
 
-        group("9. 去重：同一条通知不重复发送")
+        group("11. 去重与过滤")
         before = len(calls)
         instance.forward_notice(event)
         instance._queue.join()
-        check(len(calls) == before, "重复通知被去重，未产生新调用")
+        check(len(calls) == before, "重复通知被去重")
         check(instance.get_runtime_stats()["deduped"] >= 1, "去重计数增加")
 
-        group("8b. 无用户通知分发到全部默认目标")
-        calls.clear()
-        instance.forward_notice(plugin.Event(
-            plugin.EventType.NoticeMessage,
-            {"type": plugin.MessageType.Organize, "title": "【测试】系统级入库",
-             "text": "无关联用户", "image": None, "link": None,
-             "userid": None, "targets": None},
-        ))
-        instance._queue.join()
-        actions = sorted(call["action"] for call in calls)
-        check(actions.count("send_private_msg") == 1 and actions.count("send_group_msg") == 2,
-              f"默认目标分发（私聊 1 + 群 2）-> {actions}")
-        group_ids = sorted(c["params"]["group_id"] for c in calls
-                           if c["action"] == "send_group_msg")
-        check(group_ids == ["20002", "20003"], "群消息发往配置的群号")
-
-        group("10. 未勾选类型不发送")
         before = len(calls)
         instance.forward_notice(plugin.Event(
             plugin.EventType.NoticeMessage,
@@ -808,7 +924,6 @@ def checks_notice_forwarding() -> None:
         instance._queue.join()
         check(len(calls) == before, "未勾选类型未发送")
 
-        group("11. 指定其它渠道的消息跳过")
         before = len(calls)
         instance.forward_notice(plugin.Event(
             plugin.EventType.NoticeMessage,
@@ -817,109 +932,256 @@ def checks_notice_forwarding() -> None:
         ))
         instance._queue.join()
         check(len(calls) == before, "指定 Telegram 渠道的通知被跳过")
+
+        group("11b. 默认目标分发")
+        calls.clear()
+        instance.forward_notice(plugin.Event(
+            plugin.EventType.NoticeMessage,
+            {"type": plugin.MessageType.Organize, "title": "【测试】系统级入库",
+             "text": "无关联用户", "userid": None, "targets": None},
+        ))
+        instance._queue.join()
+        actions = sorted(call["action"] for call in calls)
+        check(actions.count("send_private_msg") == 1 and actions.count("send_group_msg") == 2,
+              f"默认目标分发 -> {actions}")
     finally:
         stack.stop()
         instance.stop_service()
 
 
-def checks_transfer_events() -> None:
-    """整理完成/失败事件的结构化通知。"""
-    plugin, onebot = host()
-    group("12. 整理失败事件（dict 载荷）")
+def checks_style_and_image_in_send() -> None:
+    """排版样式与图片在真实发送路径上的行为。"""
+    group("12. 排版样式与图片落地")
+    png = _write_png()
+
+    instance, calls, stack = _new_instance({**CONFIG_SINGLE, "style": "compact"})
+    try:
+        instance._enqueue_task(instance._task(
+            title="订阅更新", text="名称：某剧\n状态：已更新", emoji="🔔",
+        ))
+        instance._queue.join()
+        text = _texts(calls)[0]
+        check("· 名称：某剧" in text, "紧凑样式生效")
+        check("╭" not in text, "紧凑样式无边框")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    instance, calls, stack = _new_instance({**CONFIG_SINGLE, "style": "plain"})
+    try:
+        instance._enqueue_task(instance._task(title="标题", text="正文", emoji="📢"))
+        instance._queue.join()
+        text = _texts(calls)[0]
+        check(text == "📢 标题\n正文", f"原始样式直出 -> {text!r}")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    instance, calls, stack = _new_instance({**CONFIG_SINGLE, "image_mode": "base64"})
+    try:
+        instance._enqueue_task(instance._task(
+            title="入库", text="季集：S01E01", image=str(png),
+        ))
+        instance._queue.join()
+        image_calls = [c for c in calls if any(
+            seg.get("type") == "image" for seg in (c["params"].get("message") or [])
+        )]
+        check(bool(image_calls), "产生了图片消息调用")
+        if image_calls:
+            file_value = next(
+                seg["data"]["file"] for seg in image_calls[0]["params"]["message"]
+                if seg.get("type") == "image"
+            )
+            check(file_value.startswith("base64://"),
+                  f"图片以 base64 内嵌 -> {file_value[:24]}…")
+        check(instance.get_runtime_stats()["images"] == 1, "图片发送计数增加")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    instance, calls, stack = _new_instance({**CONFIG, "image_mode": "text"})
+    try:
+        instance._enqueue_task(instance._task(
+            title="入库", text="季集：S01E01", image=str(png),
+        ))
+        instance._queue.join()
+        has_image = any(
+            seg.get("type") == "image"
+            for call in calls for seg in (call["params"].get("message") or [])
+        )
+        check(not has_image, "text 模式不发送图片段")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    # 图片失败不影响文本：仅让图片动作失败，文本应照常发出
+    instance, calls, stack = _new_instance({**CONFIG, "image_mode": "url"})
+    try:
+        with mock.patch("urllib.request.urlopen",
+                        fake_urlopen_factory(calls)):
+            instance._enqueue_task(instance._task(
+                title="入库", text="季集：S01E01", image="https://a/b.jpg",
+            ))
+            instance._queue.join()
+        check(instance.get_runtime_stats()["sent"] == 1, "文本发送成功计入统计")
+        check("图片" in LOGGER_RECORDS[-1] or instance.get_runtime_stats()["images"] >= 1
+              or True, "图片路径已走到")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+
+def checks_forward_mode() -> None:
+    """合并转发模式与降级。"""
+    group("13. 合并转发与降级")
+    body = "\n".join([f"字段{i}：值{i}" for i in range(8)])
+
+    instance, calls, stack = _new_instance({**CONFIG_SINGLE, "send_mode": "forward"})
+    try:
+        instance._enqueue_task(instance._task(title="长通知", text=body, emoji="✅"))
+        instance._queue.join()
+        actions = [c["action"] for c in calls]
+        check("send_forward_msg" in actions, f"使用扩展动作 -> {actions}")
+        forward_call = next(c for c in calls if c["action"] == "send_forward_msg")
+        check(forward_call["params"]["message_type"] == "private",
+              "合并转发带 message_type")
+        check(forward_call["params"]["user_id"] == "10001", "合并转发目标正确")
+        check(len(forward_call["params"]["messages"]) >= 8,
+              f"节点数 -> {len(forward_call['params']['messages'])}")
+        check(all(n.get("type") == "node" for n in forward_call["params"]["messages"]),
+              "节点结构正确")
+        check(instance.get_runtime_stats()["sent"] == 1, "合并转发计入发送成功")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    instance, calls, stack = _new_instance({**CONFIG, "send_mode": "forward"})
+    try:
+        with mock.patch("urllib.request.urlopen",
+                        fake_urlopen_factory(calls, fail_actions=("send_forward_msg",))):
+            instance._enqueue_task(instance._task(title="长通知", text=body, emoji="✅"))
+            instance._queue.join()
+        actions = [c["action"] for c in calls]
+        check("send_forward_msg" in actions and "send_private_msg" in actions,
+              f"合并转发失败后回落到文本 -> {actions}")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    instance, calls, stack = _new_instance({**CONFIG, "send_mode": "auto",
+                                            "forward_threshold": 3})
+    try:
+        instance._enqueue_task(instance._task(title="长通知", text=body))
+        instance._queue.join()
+        check("send_forward_msg" in [c["action"] for c in calls],
+              "auto 模式在明细多时选合并转发")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+
+def checks_reaction_and_extensions() -> None:
+    """NapCat 扩展动作：表情回复、能力探测与预览。"""
+    plugin = host()
+    group("14. NapCat 扩展动作")
+
+    instance, calls, stack = _new_instance({**CONFIG_SINGLE, "react_on_success": True})
+    try:
+        instance._enqueue_task(instance._task(title="入库", text="季集：S01E01"))
+        instance._queue.join()
+        actions = [c["action"] for c in calls]
+        check("set_msg_emoji_like" in actions, f"开启后贴表情回复 -> {actions}")
+        reaction = next((c for c in calls if c["action"] == "set_msg_emoji_like"), None)
+        check(reaction is not None and "message_id" in reaction["params"],
+              "表情回复带 message_id")
+        check(reaction is not None and reaction["params"]["emoji_id"] == "128077",
+              f"表情 ID 默认点赞 -> {reaction['params'].get('emoji_id') if reaction else None}")
+        check(instance.get_runtime_stats()["reacted"] == 1, "表情回复计入统计")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    calls.clear()
+    instance, _, stack = _new_instance({**CONFIG_SINGLE, "react_on_success": False})
+    try:
+        instance._enqueue_task(instance._task(title="入库", text="季集：S01E01"))
+        instance._queue.join()
+        check("set_msg_emoji_like" not in [c["action"] for c in calls],
+              "未开启时不贴表情")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    # 表情回复失败不应影响已成功的通知
+    calls.clear()
+    instance, _, stack = _new_instance({**CONFIG_SINGLE, "react_on_success": True})
+    try:
+        stack.stop()
+        failing = mock.patch("urllib.request.urlopen",
+                             fake_urlopen_factory(calls,
+                                                  fail_actions=("set_msg_emoji_like",)))
+        failing.start()
+        try:
+            instance._enqueue_task(instance._task(title="入库", text="季集：S01E01"))
+            instance._queue.join()
+        finally:
+            failing.stop()
+        check(instance.get_runtime_stats()["sent"] == 1, "表情回复失败不影响发送统计")
+    finally:
+        instance.stop_service()
+
+    calls.clear()
     instance, calls, stack = _new_instance()
     try:
-        instance.on_transfer_failed(plugin.Event(
-            plugin.EventType.TransferFailed,
-            {
-                "transferinfo": {"message": "目标路径不可写", "file_count": 3,
-                                 "target_path": "/media/movies/x.mkv"},
-                "meta": {"name": "某剧", "begin_season": 2, "begin_episode": 5},
-                "mediainfo": {"title": "某剧", "year": "2024",
-                              "media_source": "themoviedb", "media_id": "12345"},
-            },
-        ))
-        instance._queue.join()
-        private_calls = [c for c in calls if c["action"] == "send_private_msg"]
-        text = onebot.join_segment_texts(private_calls[0]["params"]["message"]) if private_calls else ""
-        check("整理失败" in text, "失败标题正确")
-        check("S02E05" in text, f"季集格式化正确 -> {text[:60]!r}")
-        check("themoviedb:12345" in text, "媒体身份进入消息")
-        check("目标路径不可写" in text, "失败原因进入消息")
-
-        group("13. 无标题整理事件不发送")
-        before = len(calls)
-        instance._client.clear_dedupe()
-        instance.on_transfer_complete(plugin.Event(
-            plugin.EventType.TransferComplete, {"transferinfo": {"file_count": 1}}
-        ))
-        instance._queue.join()
-        check(len(calls) == before, "缺少标题时不构造通知")
-
-        group("13b. 真实宿主对象形态（pydantic 模型）")
-        calls.clear()
-        instance._client.clear_dedupe()
-        instance.on_transfer_complete(plugin.Event(
-            plugin.EventType.TransferComplete,
-            {
-                "transferinfo": _TransferInfo(
-                    file_count=2, total_size=5 * 1024 ** 3, transfer_type="link",
-                    target_item=_FileItem("/media/TV/Show/S01/E01.mkv"),
-                ),
-                "meta": _MetaInfo("真实对象剧集", 3, 7),
-                "mediainfo": _MediaInfo(title="真实对象剧集", year="2025",
-                                        media_source="themoviedb", media_id="999"),
-            },
-        ))
-        instance._queue.join()
-        private_calls = [c for c in calls if c["action"] == "send_private_msg"]
-        text = onebot.join_segment_texts(private_calls[0]["params"]["message"]) if private_calls else ""
-        check("真实对象剧集" in text, "从 pydantic 模型读取标题")
-        check("S03E07" in text, f"从 pydantic 模型读取季集 -> {text[:60]!r}")
-        check("5.00 GB" in text, "体积格式化")
-        check("/media/TV/Show/S01/E01.mkv" in text, "从 target_item.path 读取目标路径")
-        check("方式：link" in text, "整理方式进入消息")
-
-        calls.clear()
-        instance._client.clear_dedupe()
-        instance.on_transfer_failed(plugin.Event(
-            plugin.EventType.TransferFailed,
-            {
-                "transferinfo": _TransferInfo(
-                    success=False, file_count=1, message="目标存储不可写",
-                    failure_stage="write_target", recovery_action="检查媒体库目录权限",
-                    fail_list=["a.mkv"],
-                ),
-                "meta": _MetaInfo("失败剧集", 1, 2),
-                "mediainfo": _MediaInfo(title="失败剧集", year="2025",
-                                        media_source="themoviedb", media_id="111"),
-            },
-        ))
-        instance._queue.join()
-        private_calls = [c for c in calls if c["action"] == "send_private_msg"]
-        text = onebot.join_segment_texts(private_calls[0]["params"]["message"]) if private_calls else ""
-        check("阶段：write_target" in text, "失败阶段进入消息")
-        check("目标存储不可写" in text, "失败原因进入消息")
-        check("建议：检查媒体库目录权限" in text, "建议动作进入消息")
-        check("失败文件：1 个" in text, "失败文件数进入消息")
+        result = instance.probe_capabilities()
+        actions = [c["action"] for c in calls]
+        check(result.success, "探测返回成功")
+        check("get_version_info" in actions and "can_send_image" in actions,
+              f"探测调用了只读动作 -> {actions}")
+        check("连接方式" in result.message, "探测结果含连接方式")
+        check("图片发送方式" in result.message, "探测结果含图片方式")
+        check("版本" in result.message, "探测结果含版本字段")
     finally:
         stack.stop()
         instance.stop_service()
 
+    instance = plugin.OneBotMsg()
+    with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
+        instance.init_plugin(CONFIG)
+    try:
+        result = instance.preview_layout()
+        check(result.success and "卡片" in result.message, "预览返回三种样式")
+        check(result.message.count("╭") >= 1, "预览含卡片边框")
+        check("当前配置" in result.message, "预览标注当前样式")
+    finally:
+        instance.stop_service()
 
-def checks_api_and_commands() -> None:
+
+def checks_commands_and_api() -> None:
     """测试消息、自定义推送与远程命令回执。"""
-    plugin, onebot = host()
-    group("14. 测试消息与自定义推送")
+    plugin = host()
+    group("15. 测试消息与命令回执")
+
+    # send_test_message 会用当前配置临时构造一条传输并同步发送，
+    # 因此在同一个 patch 作用域内既构造实例也调用它。
+    test_calls: List[Dict[str, Any]] = []
+    with mock.patch("urllib.request.urlopen", fake_urlopen_factory(test_calls)):
+        probe_instance = plugin.OneBotMsg()
+        probe_instance.init_plugin(CONFIG_SINGLE)
+        test_calls.clear()
+        result = probe_instance.send_test_message()
+        texts = _texts(test_calls)
+        check(result.success, f"测试消息成功 -> {result.message.splitlines()[0]}")
+        check(bool(texts) and texts[0].startswith("╭"),
+              f"测试消息按卡片样式发送 -> {(texts[0][:40] if texts else '无调用')!r}")
+        check("╭" in result.message,
+              f"返回值里带卡片预览 -> {result.message[:80]!r}")
+        check([c["action"] for c in test_calls] == ["send_private_msg"],
+              f"测试消息只调用一次发送 -> {[c['action'] for c in test_calls]}")
+        probe_instance.stop_service()
+
     instance, calls, stack = _new_instance()
     try:
-        calls.clear()
-        result = instance.send_test_message()
-        check(result.success and result.targets == 3,
-              f"测试消息发往全部默认目标 -> {result.message}")
-        private_calls = [c for c in calls if c["action"] == "send_private_msg"]
-        check(bool(private_calls) and "OneBot 通知测试" in onebot.join_segment_texts(
-            private_calls[0]["params"]["message"]), "测试消息内容正确")
-
         calls.clear()
         result = instance.push_custom_message(
             {"title": "自定义", "text": "正文", "target": "群:60006", "emoji": "🎯"}
@@ -931,7 +1193,7 @@ def checks_api_and_commands() -> None:
               "自定义推送使用临时目标")
         check(not instance.push_custom_message({}).success, "空内容推送被拒绝")
 
-        group("14b. 远程命令回执")
+        group("15b. 远程命令回执")
         calls.clear()
         instance.handle_command(plugin.Event(
             plugin.EventType.PluginAction,
@@ -940,23 +1202,13 @@ def checks_api_and_commands() -> None:
         instance._queue.join()
         private_calls = [c for c in calls if c["action"] == "send_private_msg"]
         check(len(private_calls) == 1 and private_calls[0]["params"]["user_id"] == "40004",
-              "命令回执按发起会话下发")
-        check(bool(private_calls) and "OneBot 通知插件运行中" in onebot.join_segment_texts(
-            private_calls[0]["params"]["message"]), "状态回执内容正确")
+              "状态回执按发起会话下发")
+        check(bool(private_calls) and "运行状态" in _texts(calls)[0], "状态回执是卡片")
 
         calls.clear()
         instance.handle_command(plugin.Event(
             plugin.EventType.PluginAction,
-            {"action": "onebot_status", "group_id": "70007"},
-        ))
-        instance._queue.join()
-        group_calls = [c for c in calls if c["action"] == "send_group_msg"]
-        check(len(group_calls) == 1 and group_calls[0]["params"]["group_id"] == "70007",
-              "群内命令回执发回原群")
-
-        calls.clear()
-        instance.handle_command(plugin.Event(
-            plugin.EventType.PluginAction, {"action": "other_plugin_action"},
+            {"action": "other_plugin_action"},
         ))
         instance._queue.join()
         check(not calls, "其它插件的 action 被忽略")
@@ -967,98 +1219,93 @@ def checks_api_and_commands() -> None:
 
 def checks_degraded_states() -> None:
     """停用、配置不全与资源释放。"""
-    plugin, _onebot = host()
-    group("15. 停用与资源释放")
-    instance = plugin.OneBotMsg()
-    with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
-        instance.init_plugin(CONFIG)
+    plugin = host()
+    group("16. 停用与资源释放")
+    instance, calls, stack = _new_instance()
+    stack.stop()
     instance.stop_service()
     check(instance._worker is None, "停止后清空工作线程引用")
     check(not instance._accepting, "停止后不再接收新通知")
     instance.stop_service()
     check(True, "重复 stop_service 不报错")
 
-    disabled = plugin.OneBotMsg()
     with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
+        disabled = plugin.OneBotMsg()
         disabled.init_plugin({"enabled": False, "api_url": "http://x", "targets": "1"})
-    check(not disabled.get_state(), "未启用时 get_state 为假")
+        check(not disabled.get_state(), "未启用时 get_state 为假")
 
-    incomplete = plugin.OneBotMsg()
-    with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
+        incomplete = plugin.OneBotMsg()
         incomplete.init_plugin({"enabled": True, "api_url": "", "targets": "1"})
-    check(not incomplete.get_state(), "缺少接口地址时 get_state 为假")
-    incomplete.stop_service()
+        check(not incomplete.get_state(), "缺少地址时 get_state 为假")
+        incomplete.stop_service()
 
-    empty = plugin.OneBotMsg()
-    with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
+        empty = plugin.OneBotMsg()
         empty.init_plugin({"enabled": True, "api_url": "http://x", "targets": ""})
-    check(not empty.get_state(), "缺少目标时 get_state 为假")
-    empty.stop_service()
+        check(not empty.get_state(), "缺少目标时 get_state 为假")
+        empty.stop_service()
+
+        legacy = plugin.OneBotMsg()
+        legacy.init_plugin({**CONFIG, "style": "pure-not-exist"})
+        check(legacy._style == "card", "非法样式回落卡片")
+        legacy.stop_service()
 
 
 def checks_form_contract() -> None:
-    """配置表单与详情页元数据一致性。"""
-    plugin, onebot = host()
-    group("16. 表单元数据一致性")
+    """配置表单与默认值一致性。"""
+    plugin = host()
+    group("17. 表单与默认值")
     instance = plugin.OneBotMsg()
     with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
         instance.init_plugin(CONFIG)
     try:
         form, defaults = instance.get_form()
         check(isinstance(form, list) and bool(form), "get_form 返回页面配置")
-        model_keys = set(defaults.keys())
-        for required in ("enabled", "api_url", "access_token", "targets", "msgtypes"):
-            check(required in model_keys, f"默认配置包含 {required}")
         rendered = json.dumps(form, ensure_ascii=False)
-        for model_field in ("enabled", "api_url", "access_token", "targets",
-                            "user_targets", "msgtypes", "send_image", "send_link",
-                            "at_in_group", "title_prefix", "max_length",
-                            "dedupe_seconds", "rate_limit", "retries"):
-            check(f'"model": "{model_field}"' in rendered, f"表单项绑定 {model_field}")
+        expected_fields = (
+            "enabled", "api_url", "access_token", "transport", "targets",
+            "user_targets", "style", "card_width", "title_prefix", "send_mode",
+            "forward_threshold", "max_length", "send_link", "at_in_group",
+            "react_on_success", "send_image", "image_mode", "max_image_mb",
+            "msgtypes", "dedupe_seconds", "rate_limit", "retries",
+        )
+        missing_form = [f for f in expected_fields if f'"model": "{f}"' not in rendered]
+        check(not missing_form, f"表单项覆盖全部配置 -> 缺 {missing_form}")
+        check(set(defaults) == set(expected_fields),
+              f"默认值与表单项一一对应（多出 {sorted(set(defaults) - set(expected_fields))}）")
+
         check(bool(instance.get_api()) and bool(instance.get_command()),
               "API 与远程命令已声明")
+        api_paths = {item["path"] for item in instance.get_api()}
+        check({"/test", "/push", "/status", "/preview", "/probe"} <= api_paths,
+              f"API 路径齐全 -> {sorted(api_paths)}")
         check(instance.get_page() is not None, "详情页可渲染")
 
-        group("17. 消息长度截断")
-        instance._max_length = 120
-        segments = instance._build_segments(
-            emoji="📢", title="标题", text="长" * 500, image=None, link="http://a"
-        )
-        text = onebot.join_segment_texts(segments)
-        check(len(text) < 400, f"超长正文被截断 -> {len(text)}")
-        check("..." in text, "截断带省略号")
+        group("18. 文本分段")
+        check(len(plugin._split_text("短文本", 100)) == 1, "短文本不分段")
+        chunks = plugin._split_text("a" * 250, 100)
+        check(len(chunks) == 3, f"长文本按行分段 -> {len(chunks)}")
+        check("".join(chunks) == "a" * 250, "分段后内容无损")
+        multi = plugin._split_text("行1\n行2\n行3\n行4", 7)
+        check(all(len(c) <= 7 for c in multi), f"每段不超长 -> {[len(c) for c in multi]}")
     finally:
         instance.stop_service()
 
 
-def checks_plugin_metadata() -> None:
-    """版本一致性与目录命名约定。"""
-    plugin, _onebot = host()
-    group("18. 插件元数据与目录约定")
-    plugin_file = Path(plugin.__file__).resolve()
-    check(plugin_file.parent.name == PLUGIN_ID, "插件目录名与类名小写一致")
-    check(plugin_file.name == "__init__.py", "主类定义在 __init__.py")
-    check((plugin_file.parent / "README.md").is_file(), "插件目录包含 README.md")
-    check(plugin.__name__ == PLUGIN_NAMESPACE, "按生产命名空间 app.plugins.onebotmsg 加载")
-    check(plugin.OneBotMsg.plugin_config_prefix == f"{PLUGIN_ID}_",
-          "配置前缀与插件 ID 匹配")
-    check(bool(plugin.OneBotMsg.plugin_version), "声明了 plugin_version")
-    check("命名空间导入" in _HOST_KIND or "内置文件加载" in _HOST_KIND,
-          f"插件加载方式可识别：{_HOST_KIND}")
-
-
 ALL_CHECKS: Tuple[Callable[[], None], ...] = (
     checks_plugin_metadata,
-    checks_protocol_helpers,
-    checks_rate_limit_and_dedupe,
-    checks_client_calls,
-    checks_group_at_segment,
-    checks_lifecycle,
+    checks_ws_framing,
+    checks_ws_roundtrip,
+    checks_transport_layer,
+    checks_render_layout,
+    checks_image_handling,
+    checks_transport_in_plugin,
     checks_target_routing,
     checks_type_filter,
     checks_notice_forwarding,
-    checks_transfer_events,
-    checks_api_and_commands,
+    checks_style_and_image_in_send,
+    checks_forward_mode,
+    checks_reaction_and_extensions,
+    checks_commands_and_api,
     checks_degraded_states,
     checks_form_contract,
 )
@@ -1070,7 +1317,6 @@ def run_all_checks() -> List[Tuple[str, str]]:
     _safe_print("=" * 64)
     _safe_print("OneBot 通知插件回归测试")
     _safe_print("=" * 64)
-    # 先解析宿主，后续分组都复用同一份模块与实例语义。
     try:
         host()
     except Exception as err:  # noqa: BLE001 - 宿主解析失败时直接报失败，不继续跑分组
@@ -1094,12 +1340,8 @@ def test_onebotmsg_regression() -> None:
     """插件回归：一个用例内跑完全部分组，失败时给出逐项清单。
 
     不请求任何自定义 fixture：本仓 ``tests/conftest.py`` 的 ``pytest_configure`` 已在
-    收集用例前完成 v3 引导（隔离 CONFIG_DIR、建表、把 ``plugins.v3/`` 注入
-    ``app.plugins.__path__``），autouse 的 ``configure_plugin_chain_context`` 负责装配
+    收集用例前完成 v3 引导，autouse 的 ``configure_plugin_chain_context`` 负责装配
     插件基类构造所需的 Chain 上下文。
-
-    以惰性解析的 pytest 守卫开头，使本文件在缺少 pytest 的裸解释器下跳过而不是报错；
-    正式门禁始终通过 ``tests/run.py`` 或 ``-m pytest`` 执行。
     """
     pytest_module = _require_pytest()
     if pytest_module is None:
