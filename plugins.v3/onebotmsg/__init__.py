@@ -38,11 +38,18 @@ except Exception:  # noqa: BLE001
     resolve_media_identity = None  # type: ignore[assignment]
 
 from .napcat import (
+    IMAGE_LAYOUT_ATTACH,
+    IMAGE_LAYOUT_LABELS,
+    IMAGE_LAYOUT_SEPARATE,
     IMAGE_MODE_AUTO,
     IMAGE_MODE_LABELS,
     IMAGE_MODE_TEXT,
+    IMAGE_POSITION_BOTTOM,
+    IMAGE_POSITION_LABELS,
+    IMAGE_POSITION_TOP,
     can_send_image,
     forward_node,
+    image_segment,
     normalize_image_candidates,
     probe_extensions,
     segments_text,
@@ -63,6 +70,7 @@ from .render import (
     STYLE_CARD,
     STYLE_COMPACT,
     STYLE_LABELS,
+    STYLE_MINIMAL,
     STYLE_PLAIN,
     build_card,
     build_forward_nodes,
@@ -137,7 +145,7 @@ class OneBotMsg(_PluginBase):
     # 插件市场索引与插件类声明同一个字段，两者必须保持同一形式。
     plugin_icon = "https://raw.githubusercontent.com/NapNeko/NapCatQQ/main/logo.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "TANZZZ"
     # 作者主页
@@ -169,6 +177,8 @@ class OneBotMsg(_PluginBase):
     _msgtypes: List[str] = []
     _send_image: bool = True
     _image_mode: str = IMAGE_MODE_AUTO
+    _image_layout: str = IMAGE_LAYOUT_ATTACH
+    _image_position: str = IMAGE_POSITION_TOP
     _max_image_mb: float = 3.0
     _send_link: bool = True
     _at_in_group: bool = False
@@ -258,6 +268,12 @@ class OneBotMsg(_PluginBase):
         self._send_image = bool(config.get("send_image", True))
         self._image_mode = str(config.get("image_mode") or IMAGE_MODE_AUTO).strip() \
             or IMAGE_MODE_AUTO
+        self._image_layout = _as_choice(
+            config.get("image_layout"), IMAGE_LAYOUT_LABELS, IMAGE_LAYOUT_ATTACH,
+        )
+        self._image_position = _as_choice(
+            config.get("image_position"), IMAGE_POSITION_LABELS, IMAGE_POSITION_TOP,
+        )
         self._max_image_mb = _as_float(config.get("max_image_mb"), 3.0)
         self._send_link = bool(config.get("send_link", True))
         self._at_in_group = bool(config.get("at_in_group"))
@@ -473,7 +489,16 @@ class OneBotMsg(_PluginBase):
                        image: Optional[str], user_ids: List[str],
                        group_ids: List[str], at_user: Optional[str],
                        allow_image_fallback: bool = True) -> Tuple[bool, str]:
-        """按卡片样式发送：文本 + 可选图片 + 可选链接。"""
+        """按卡片样式发送：文本 + 可选图片 + 可选链接。
+
+        图片有两种呈现方式（配置 ``image_layout``）：
+
+        * ``attach``（默认）：图片段与文本段**放进同一条消息**，QQ 会把它们显示在
+          同一个气泡里，海报就成了通知的一部分，比「先一条文字、再一条图片」紧凑得多；
+        * ``separate``：先发文本、再单独发图片（1.1.0 的行为）。
+
+        inline 失败时自动退回 separate，保证图片和文字都不会丢。
+        """
         card = build_card(
             emoji=emoji,
             title=title,
@@ -484,54 +509,157 @@ class OneBotMsg(_PluginBase):
             max_width=self._card_width,
         )
         chunks = _split_text(card, self._max_length)
+
+        image_files: List[str] = []
+        image_note = ""
+        if image:
+            image_files, image_note = self._image_candidates(image)
+
+        detail_parts: List[str] = []
+        inline_ok = False
+        if image_files and self._image_layout == IMAGE_LAYOUT_ATTACH:
+            inline_ok, inline_detail = self._send_inline(
+                transport, title=title, chunks=chunks, image_file=image_files[0],
+                user_ids=user_ids, group_ids=group_ids, at_user=at_user,
+            )
+            if inline_ok:
+                self._bump("images")
+                detail_parts.append(f"图文同条（{inline_detail}）")
+            else:
+                logger.debug(f"图文同条失败，改为分开发送：{inline_detail}")
+
+        if not inline_ok:
+            results: List[OneBotResponse] = []
+            for index, chunk in enumerate(chunks):
+                body = chunk if len(chunks) == 1 else f"({index + 1}/{len(chunks)})\n{chunk}"
+                results.extend(self._send_text_once(transport, body, user_ids, group_ids,
+                                                    at_user))
+            failed = [result for result in results if not result.ok]
+            if not results:
+                return False, "没有产生任何调用"
+            if failed:
+                errors = [f"{r.action}: {r.error}" for r in failed[:3]]
+                return False, (f"成功 {len(results) - len(failed)}/{len(results)}；"
+                               f"{'; '.join(errors)}")
+            detail_parts.append(f"{len(results)} 个目标")
+
+            if image_files:
+                image_ok, image_detail = self._send_image_to_targets(
+                    transport, image=image, candidates=image_files,
+                    user_ids=user_ids, group_ids=group_ids,
+                )
+                if image_ok:
+                    self._bump("images")
+                    detail_parts.append(image_detail)
+                else:
+                    detail_parts.append(f"图片未发送（{image_detail}）")
+                    if allow_image_fallback and self._style != STYLE_PLAIN:
+                        logger.debug(f"图片发送失败：{image_detail}")
+        elif image_note:
+            detail_parts.append(image_note)
+        return True, "；".join(detail_parts)
+
+    def _image_candidates(self, image: str) -> Tuple[List[str], str]:
+        """把图片来源解析为按优先级排序的候选发送值。"""
+        target_dir = None
+        try:
+            target_dir = self.get_data_path() / "images"
+        except Exception as err:  # noqa: BLE001 - 数据目录不可用时仍可走 URL/base64
+            logger.debug(f"获取插件数据目录失败，图片仅支持 URL/base64：{err}")
+        try:
+            max_bytes = int(max(self._max_image_mb, 0.1) * 1024 * 1024)
+        except (TypeError, ValueError):
+            max_bytes = 3 * 1024 * 1024
+        candidates, notes = normalize_image_candidates(
+            image, target_dir=target_dir, mode=self._image_mode, max_bytes=max_bytes,
+        )
+        return candidates, "；".join(notes)
+
+    def _send_text_once(self, transport: Transport, body: str,
+                        user_ids: List[str], group_ids: List[str],
+                        at_user: Optional[str]) -> List[OneBotResponse]:
+        """把一段成品文本发给所有目标，返回每次调用的结果。"""
         results: List[OneBotResponse] = []
-        for index, chunk in enumerate(chunks):
-            body = chunk if len(chunks) == 1 else f"({index + 1}/{len(chunks)})\n{chunk}"
-            for user_id in user_ids:
-                params: Dict[str, Any] = {
-                    "user_id": str(user_id),
-                    "message": [text_segment(body)],
-                }
-                result = transport.call("send_private_msg", params)
-                if result is not None:
-                    results.append(result)
-                if result is not None and result.ok and result.message_id is not None:
+        for user_id in user_ids:
+            result = transport.call("send_private_msg", {
+                "user_id": str(user_id),
+                "message": [text_segment(body)],
+            })
+            if result is not None:
+                results.append(result)
+                if result.ok and result.message_id is not None:
                     self._last_message_id = result.message_id
-            for group_id in group_ids:
-                segments: List[Dict[str, Any]] = []
-                if at_user:
-                    segments.append({"type": "at", "data": {"qq": str(at_user)}})
-                segments.append(text_segment(body))
-                result = transport.call("send_group_msg", {
-                    "group_id": str(group_id),
-                    "message": segments,
-                })
-                if result is not None:
-                    results.append(result)
-                if result is not None and result.ok and result.message_id is not None:
+        for group_id in group_ids:
+            segments: List[Dict[str, Any]] = []
+            if at_user:
+                segments.append({"type": "at", "data": {"qq": str(at_user)}})
+            segments.append(text_segment(body))
+            result = transport.call("send_group_msg", {
+                "group_id": str(group_id),
+                "message": segments,
+            })
+            if result is not None:
+                results.append(result)
+                if result.ok and result.message_id is not None:
+                    self._last_message_id = result.message_id
+        return results
+
+    def _send_inline(self, transport: Transport, *, title: str, chunks: List[str],
+                     image_file: str, user_ids: List[str], group_ids: List[str],
+                     at_user: Optional[str]) -> Tuple[bool, str]:
+        """把图片与文本放进同一条消息发送。
+
+        只在**单段文本**时拼接：多段说明内容超长，图片挂在第一段反而割裂；
+        此时交给调用方回退为分开发送。
+        """
+        if not image_file:
+            return False, "没有可用的图片形式"
+        if len(chunks) != 1:
+            return False, f"文本被分成 {len(chunks)} 段，不适合图文同条"
+        body = chunks[0]
+        image_seg = image_segment(image_file)
+        text_seg = text_segment(body)
+
+        def _segments(at: bool) -> List[Dict[str, Any]]:
+            """按配置顺序组装消息段；``at`` 为真时把 @ 段放在最前。"""
+            head: List[Dict[str, Any]] = []
+            if at and at_user:
+                head.append({"type": "at", "data": {"qq": str(at_user)}})
+            pair = ([image_seg, text_seg] if self._image_position == IMAGE_POSITION_TOP
+                    else [text_seg, image_seg])
+            return head + pair
+
+        results: List[OneBotResponse] = []
+        for user_id in user_ids:
+            result = transport.call("send_private_msg", {
+                "user_id": str(user_id),
+                "message": _segments(False),
+            })
+            if result is not None:
+                results.append(result)
+                if result.ok and result.message_id is not None:
+                    self._last_message_id = result.message_id
+        for group_id in group_ids:
+            # 这里必须传 @ 的 QQ 号本身，不能传布尔值——否则段里会变成 {"qq": "True"}。
+            result = transport.call("send_group_msg", {
+                "group_id": str(group_id),
+                "message": _segments(bool(at_user)),
+            })
+            if result is not None:
+                results.append(result)
+                if result.ok and result.message_id is not None:
                     self._last_message_id = result.message_id
 
-        failed = [result for result in results if not result.ok]
         if not results:
             return False, "没有产生任何调用"
+        failed = [result for result in results if not result.ok]
         if failed:
-            errors = [f"{r.action}: {r.error}" for r in failed[:3]]
+            errors = [f"{r.action}: {r.error}" for r in failed[:2]]
             return False, f"成功 {len(results) - len(failed)}/{len(results)}；{'; '.join(errors)}"
-
-        # 文本成功后补发图片；图片失败不回滚文本，只记录并降级说明。
-        detail = f"{len(results)} 个目标"
-        if image:
-            image_ok, image_detail = self._send_image_to_targets(
-                transport, image=image, user_ids=user_ids, group_ids=group_ids,
-            )
-            if image_ok:
-                self._bump("images")
-                detail = f"{detail}；{image_detail}"
-            else:
-                detail = f"{detail}；图片未发送（{image_detail}）"
-                if allow_image_fallback and self._style != STYLE_PLAIN:
-                    logger.debug(f"图片发送失败：{image_detail}")
-        return True, detail
+        form = "base64" if image_file.lower().startswith(("base64://", "data:")) else (
+            "URL" if image_file.lower().startswith(("http://", "https://")) else "本地路径"
+        )
+        return True, f"{len(results)} 个目标 · 图片按 {form}"
 
     def _send_text_to_targets(self, transport: Transport, text: str,
                               user_ids: List[str], group_ids: List[str],
@@ -580,24 +708,20 @@ class OneBotMsg(_PluginBase):
 
     def _send_image_to_targets(self, transport: Transport, *, image: str,
                               user_ids: List[str], group_ids: List[str],
+                              candidates: Optional[List[str]] = None,
                               ) -> Tuple[bool, str]:
-        """把图片按候选形式发给所有目标，任一形式成功即算成功。"""
-        target_dir = None
-        try:
-            target_dir = self.get_data_path() / "images"
-        except Exception as err:  # noqa: BLE001 - 数据目录不可用时仍可走 URL/base64
-            logger.debug(f"获取插件数据目录失败，图片仅支持 URL/base64：{err}")
-        try:
-            max_bytes = int(max(self._max_image_mb, 0.1) * 1024 * 1024)
-        except (TypeError, ValueError):
-            max_bytes = 3 * 1024 * 1024
-        candidates, notes = normalize_image_candidates(
-            image, target_dir=target_dir, mode=self._image_mode, max_bytes=max_bytes,
-        )
-        if not candidates:
-            return False, "；".join(notes) or "没有可用的图片形式"
+        """把图片按候选形式发给所有目标，任一形式成功即算成功。
 
-        outcomes: List[str] = list(notes)
+        ``candidates`` 已由调用方解析时直接复用，避免重复下载同一张图片。
+        """
+        notes: List[str] = []
+        if candidates is None:
+            candidates, note = self._image_candidates(image)
+            notes.append(note) if note else None
+        if not candidates:
+            return False, "；".join(filter(None, notes)) or "没有可用的图片形式"
+
+        outcomes: List[str] = list(filter(None, notes))
         for index, file_value in enumerate(candidates):
             ok_all = True
             for user_id in user_ids:
@@ -870,18 +994,10 @@ class OneBotMsg(_PluginBase):
         if not users and not groups:
             users.extend(self._private_users)
             groups.extend(self._groups)
+            # 回落到默认目标时，若配了默认私聊对象，就 @ 他——否则群里看不出这条是给谁的。
+            at_user = users[0] if users else None
 
         return _unique(users), _unique(groups), at_user
-
-    def _enqueue(self, title: str, segments: List[Dict[str, Any]],
-                 userid: Optional[Union[str, int]],
-                 username: Optional[Union[str, int]],
-                 targets: Optional[Dict[str, Any]]) -> None:
-        """解析目标后把一条通知放入发送队列。"""
-        self._enqueue_task(self._task(
-            title=title, text=text, emoji=emoji, link=link, image=image,
-            userid=userid, username=username, targets=targets,
-        ))
 
     # ------------------------------------------------------------ 消息构造
 
@@ -1349,6 +1465,10 @@ class OneBotMsg(_PluginBase):
         style_options = [{"title": STYLE_LABELS[key], "value": key} for key in STYLE_LABELS]
         image_options = [{"title": IMAGE_MODE_LABELS[key], "value": key}
                          for key in IMAGE_MODE_LABELS]
+        image_layout_options = [{"title": IMAGE_LAYOUT_LABELS[key], "value": key}
+                                for key in IMAGE_LAYOUT_LABELS]
+        image_position_options = [{"title": IMAGE_POSITION_LABELS[key], "value": key}
+                                  for key in IMAGE_POSITION_LABELS]
         send_mode_options = [{"title": SEND_MODE_LABELS[SEND_MODE_TEXT],
                               "value": SEND_MODE_TEXT},
                              {"title": SEND_MODE_LABELS[SEND_MODE_FORWARD],
@@ -1406,9 +1526,15 @@ class OneBotMsg(_PluginBase):
                 self._section(
                     "图片", "图片发不出来时优先改这里：base64 内嵌不依赖网络可达性",
                     self._field("image_mode", "图片发送方式", kind="VSelect",
-                                items=image_options, md=6),
+                                items=image_options, md=4),
+                    self._field("image_layout", "图文组合方式", kind="VSelect",
+                                items=image_layout_options, md=4,
+                                hint="「图文同条」把海报嵌进通知气泡里，最紧凑"),
+                    self._field("image_position", "同条时图片位置", kind="VSelect",
+                                items=image_position_options, md=4),
                     self._field("max_image_mb", "base64 体积上限（MB）",
-                                placeholder="3", field_type="number", min_value=0.1, md=6),
+                                placeholder="3", field_type="number", min_value=0.1, md=6,
+                                hint="超过上限会退回 URL 方式"),
                 ),
                 self._section(
                     "推送范围与稳定性", "控制推送哪些场景、以及发送节奏",
@@ -1534,6 +1660,8 @@ class OneBotMsg(_PluginBase):
             "title_prefix": "",
             "send_image": True,
             "image_mode": IMAGE_MODE_AUTO,
+            "image_layout": IMAGE_LAYOUT_ATTACH,
+            "image_position": IMAGE_POSITION_TOP,
             "max_image_mb": 3,
             "send_link": True,
             "at_in_group": False,
@@ -1778,6 +1906,12 @@ def _as_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_choice(value: Any, allowed: Dict[str, Any], default: str) -> str:
+    """把配置值限制在给定取值集合内；非法值回落到默认，避免脏配置让发送失败。"""
+    text = str(value or "").strip().lower()
+    return text if text in allowed else default
 
 
 def _type_name(mtype: Any) -> Optional[str]:

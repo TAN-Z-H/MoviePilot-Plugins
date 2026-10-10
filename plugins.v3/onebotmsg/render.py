@@ -20,12 +20,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # 排版样式标识
 STYLE_CARD = "card"
+STYLE_MINIMAL = "minimal"
 STYLE_COMPACT = "compact"
 STYLE_PLAIN = "plain"
 
 STYLE_LABELS = {
-    STYLE_CARD: "卡片（带边框，推荐）",
-    STYLE_COMPACT: "紧凑（单行标题 + 缩进正文）",
+    STYLE_CARD: "卡片（带边框，等宽字体最好看）",
+    STYLE_MINIMAL: "极简（✅ 标题 + · 字段，配海报最协调）",
+    STYLE_COMPACT: "紧凑（单行标题 + · 字段）",
     STYLE_PLAIN: "原始（不添加任何装饰）",
 }
 
@@ -43,6 +45,8 @@ DEFAULT_MAX_ROWS = 14
 def normalize_style(value: Any) -> str:
     """规范化样式配置。"""
     text = str(value or "").strip().lower()
+    if text in (STYLE_MINIMAL, "极简"):
+        return STYLE_MINIMAL
     if text in (STYLE_COMPACT, "紧凑"):
         return STYLE_COMPACT
     if text in (STYLE_PLAIN, "原始", "plaintext"):
@@ -184,7 +188,7 @@ def build_card(emoji: str, title: str, text: Optional[str], link: Optional[str],
             lines.append(link_text)
         return "\n".join(lines)
 
-    if style == STYLE_COMPACT:
+    if style in (STYLE_COMPACT, STYLE_MINIMAL):
         lines = [heading] if heading else []
         for name, item in split_fields(body):
             lines.append(f"· {name}：{item}" if name else f"· {item}")

@@ -42,6 +42,24 @@ IMAGE_MODE_LABELS = {
     IMAGE_MODE_TEXT: "不发送图片，只留链接",
 }
 
+# 图片与文本的组合方式
+IMAGE_LAYOUT_ATTACH = "attach"
+IMAGE_LAYOUT_SEPARATE = "separate"
+
+IMAGE_LAYOUT_LABELS = {
+    IMAGE_LAYOUT_ATTACH: "图文同条（海报嵌在通知里，推荐）",
+    IMAGE_LAYOUT_SEPARATE: "分开发送（先文字后图片）",
+}
+
+# 图文同条时图片在文本前还是后
+IMAGE_POSITION_TOP = "top"
+IMAGE_POSITION_BOTTOM = "bottom"
+
+IMAGE_POSITION_LABELS = {
+    IMAGE_POSITION_TOP: "图片在上（海报 + 信息卡片）",
+    IMAGE_POSITION_BOTTOM: "图片在下（信息 + 海报）",
+}
+
 # base64 内嵌的默认上限（字节）。QQ 单条消息对 base64 图片有长度限制，
 # 超过后 NapCat/服务端会拒收，因此超限时自动退化为发链接。
 DEFAULT_MAX_IMAGE_BYTES = 3 * 1024 * 1024

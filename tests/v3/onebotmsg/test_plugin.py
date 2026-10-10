@@ -483,8 +483,8 @@ def checks_plugin_metadata() -> None:
     check((plugin_file.parent / "README.md").is_file(), "插件目录包含 README.md")
     check(plugin.__name__ == PLUGIN_NAMESPACE, "按生产命名空间 app.plugins.onebotmsg 加载")
     check(plugin.OneBotMsg.plugin_config_prefix == f"{PLUGIN_ID}_", "配置前缀匹配插件 ID")
-    check(plugin.OneBotMsg.plugin_version == "1.1.0",
-          f"版本为 1.1.0（实际 {plugin.OneBotMsg.plugin_version}）")
+    check(plugin.OneBotMsg.plugin_version == "1.2.0",
+          f"版本为 1.2.0（实际 {plugin.OneBotMsg.plugin_version}）")
     for name in ("onebot", "transport", "ws", "render", "napcat"):
         check((plugin_file.parent / f"{name}.py").is_file(), f"子模块 {name}.py 存在")
     check("命名空间导入" in _HOST_KIND or "内置文件加载" in _HOST_KIND,
@@ -977,24 +977,91 @@ def checks_style_and_image_in_send() -> None:
         stack.stop()
         instance.stop_service()
 
+    # 图文同条（默认）：图片段与文本段在同一条消息里
     instance, calls, stack = _new_instance({**CONFIG_SINGLE, "image_mode": "base64"})
     try:
         instance._enqueue_task(instance._task(
-            title="入库", text="季集：S01E01", image=str(png),
+            title="入库", text="季集：S01E01", image=str(png), emoji="✅",
         ))
         instance._queue.join()
-        image_calls = [c for c in calls if any(
-            seg.get("type") == "image" for seg in (c["params"].get("message") or [])
-        )]
-        check(bool(image_calls), "产生了图片消息调用")
-        if image_calls:
-            file_value = next(
-                seg["data"]["file"] for seg in image_calls[0]["params"]["message"]
-                if seg.get("type") == "image"
-            )
-            check(file_value.startswith("base64://"),
-                  f"图片以 base64 内嵌 -> {file_value[:24]}…")
+        sent_calls = [c for c in calls if c["action"] == "send_private_msg"]
+        check(len(sent_calls) == 1, f"图文只产生一条消息 -> {len(sent_calls)} 条")
+        segments = sent_calls[0]["params"]["message"] if sent_calls else []
+        kinds = [seg.get("type") for seg in segments]
+        check(kinds == ["image", "text"], f"图片在上、文本在下 -> {kinds}")
+        image_value = next((seg["data"]["file"] for seg in segments
+                            if seg.get("type") == "image"), "")
+        check(image_value.startswith("base64://"),
+              f"图片以 base64 内嵌 -> {image_value[:24]}…")
+        check("入库" in _texts(calls)[0], "文本仍在同一条消息里")
         check(instance.get_runtime_stats()["images"] == 1, "图片发送计数增加")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    # 图片在下
+    instance, calls, stack = _new_instance({**CONFIG_SINGLE, "image_mode": "base64",
+                                            "image_position": "bottom"})
+    try:
+        instance._enqueue_task(instance._task(title="入库", text="季集：S01E01",
+                                              image=str(png)))
+        instance._queue.join()
+        kinds = [seg.get("type") for seg in calls[0]["params"]["message"]]
+        check(kinds == ["text", "image"], f"图片位置可配置 -> {kinds}")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    # 分开发送（1.1.0 的行为）
+    instance, calls, stack = _new_instance({**CONFIG_SINGLE, "image_mode": "base64",
+                                            "image_layout": "separate"})
+    try:
+        instance._enqueue_task(instance._task(title="入库", text="季集：S01E01",
+                                              image=str(png)))
+        instance._queue.join()
+        sent_calls = [c for c in calls if c["action"] == "send_private_msg"]
+        check(len(sent_calls) == 2, f"分开发送产生两条消息 -> {len(sent_calls)} 条")
+        pure_text = [c for c in sent_calls
+                     if all(seg.get("type") == "text" for seg in c["params"]["message"])]
+        pure_image = [c for c in sent_calls
+                      if any(seg.get("type") == "image" for seg in c["params"]["message"])]
+        check(len(pure_text) == 1 and len(pure_image) == 1, "一条纯文本、一条含图片")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    # 图文同条时群消息要保留 @（默认目标里配了私聊对象，群里就 @ 他）
+    instance, calls, stack = _new_instance({**CONFIG_SINGLE, "image_mode": "base64",
+                                            "targets": "10001\n群:20002",
+                                            "at_in_group": True})
+    try:
+        instance._enqueue_task(instance._task(title="入库", text="季集：S01E01",
+                                              image=str(png)))
+        instance._queue.join()
+        group_calls = [c for c in calls if c["action"] == "send_group_msg"]
+        check(bool(group_calls), "群消息已发送")
+        kinds = [seg.get("type") for seg in group_calls[0]["params"]["message"]]
+        check(kinds[0] == "at", f"群消息 @ 段仍在首位 -> {kinds}")
+        check(kinds[0] == "at" and group_calls[0]["params"]["message"][0]["data"]["qq"]
+              == "10001", "@ 的是默认私聊对象")
+        check("image" in kinds and "text" in kinds, f"群消息同样图文同条 -> {kinds}")
+        private_kinds = [seg.get("type") for seg in
+                         next(c for c in calls
+                              if c["action"] == "send_private_msg")["params"]["message"]]
+        check("at" not in private_kinds, f"私聊不加 @ -> {private_kinds}")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    # 图片读不到时不影响文本
+    instance, calls, stack = _new_instance({**CONFIG_SINGLE, "image_mode": "base64"})
+    try:
+        instance._enqueue_task(instance._task(title="入库", text="季集：S01E01",
+                                              image="/not/exist.png"))
+        instance._queue.join()
+        check(instance.get_runtime_stats()["sent"] == 1, "图片不可用时文字照常送达")
+        kinds = [seg.get("type") for seg in calls[0]["params"]["message"]]
+        check(kinds == ["text"], f"没有图片段 -> {kinds}")
     finally:
         stack.stop()
         instance.stop_service()
@@ -1265,7 +1332,8 @@ def checks_form_contract() -> None:
             "enabled", "api_url", "access_token", "transport", "targets",
             "user_targets", "style", "card_width", "title_prefix", "send_mode",
             "forward_threshold", "max_length", "send_link", "at_in_group",
-            "react_on_success", "send_image", "image_mode", "max_image_mb",
+            "react_on_success", "send_image", "image_mode", "image_layout",
+            "image_position", "max_image_mb",
             "msgtypes", "dedupe_seconds", "rate_limit", "retries",
         )
         missing_form = [f for f in expected_fields if f'"model": "{f}"' not in rendered]

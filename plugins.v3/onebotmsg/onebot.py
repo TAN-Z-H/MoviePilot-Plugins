@@ -587,25 +587,35 @@ def parse_user_target_map(value: Any) -> Dict[str, List[str]]:
 
 
 # 群目标的显式前缀，其余条目一律按私聊 QQ 号处理。
-_GROUP_PREFIXES = ("group:", "g:", "群:", "群聊:")
-_PRIVATE_PREFIXES = ("private:", "user:", "p:", "私聊:", "好友:")
+_GROUP_PREFIXES = ("group:", "g:", "群:", "群聊:", "群组:")
+_PRIVATE_PREFIXES = ("private:", "user:", "p:", "私聊:", "好友:", "个人:")
+
+
+def _fold_colon(text: str) -> str:
+    """把全角冒号折成半角，让 ``群：`` 与 ``群:`` 两种写法都能识别。
+
+    用户在不同输入法下写出的冒号并不一致，前缀识别必须两者都收，
+    否则 ``群：123456`` 会被当成一个私聊 QQ 号，消息发不到群里。
+    """
+    return text.replace("：", ":").replace("，", ",")
 
 
 def parse_qq_targets(value: Any) -> Tuple[List[str], List[str]]:
     """把目标列表拆分为私聊 QQ 号与群号。
 
     裸 QQ 号与群号在 OneBot 里都是纯数字，无法可靠自动区分，因此群目标必须
-    显式加前缀，例如 ``group:123456`` 或 ``群:123456``；没有前缀的条目按
-    私聊 QQ 号处理，避免把群号误当好友号导致发送失败。
+    显式加前缀，例如 ``group:123456``、``群:123456`` 或 ``群：123456``；
+    没有前缀的条目按私聊 QQ 号处理，避免把群号误当好友号导致发送失败。
     """
     users: List[str] = []
     groups: List[str] = []
-    for target in parse_targets(value):
-        lowered = target.lower()
+    for raw_target in parse_targets(value):
+        # 前缀用折叠后的文本判断，取值仍从原文按等长切，避免全角字符错位。
+        folded = _fold_colon(raw_target).lower()
         matched = False
         for prefix in _GROUP_PREFIXES:
-            if lowered.startswith(prefix):
-                group_id = target[len(prefix):].strip()
+            if folded.startswith(prefix):
+                group_id = raw_target[len(prefix):].strip()
                 if group_id:
                     groups.append(group_id)
                 matched = True
@@ -613,13 +623,13 @@ def parse_qq_targets(value: Any) -> Tuple[List[str], List[str]]:
         if matched:
             continue
         for prefix in _PRIVATE_PREFIXES:
-            if lowered.startswith(prefix):
-                user_id = target[len(prefix):].strip()
+            if folded.startswith(prefix):
+                user_id = raw_target[len(prefix):].strip()
                 if user_id:
                     users.append(user_id)
                 matched = True
                 break
         if matched:
             continue
-        users.append(target)
+        users.append(raw_target)
     return users, groups
