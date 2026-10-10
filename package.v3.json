@@ -1,15 +1,16 @@
 {
   "OneBotMsg": {
     "name": "OneBot v11 通知",
-    "description": "通过 OneBot v11（NapCat）向 QQ 私聊/群聊推送 MoviePilot 通知：入库整理、下载、订阅、站点、媒体服务器、插件与系统错误等场景。支持图文同条（海报刊入通知气泡）、极简/卡片等多种排版、图片 base64 内嵌与自动降级、HTTP/正向 WebSocket 双传输，以及合并转发、表情回复等 NapCat 扩展 API。",
+    "description": "通过 OneBot v11（NapCat）向 QQ 私聊/群聊推送 MoviePilot 通知：入库整理、下载、订阅、站点、媒体服务器、插件与系统错误等场景。支持内容模板自定义、图文同条（海报刊入通知气泡）、极简/卡片等多种排版、图片 base64 内嵌与自动降级、HTTP/正向 WebSocket 双传输，以及合并转发、表情回复等 NapCat 扩展 API。",
     "labels": "消息通知,QQ,OneBot",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "icon": "https://raw.githubusercontent.com/NapNeko/NapCatQQ/main/logo.png",
     "author": "TANZZZ",
     "level": 1,
     "release": true,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.3.0": "新增通知内容模板：用 ${变量}、% if、% for 自己决定通知里显示什么，可引用事件全部字段（media.title / note.size / note.files 等），并提供 size/shorten/fmt_time 辅助函数与「查看模板变量」自检接口；新增按消息类型自定义图标（Organize=🎬 或 整理入库=🎬）；新增标题模板。模板出错或变量缺失都不会丢通知：缺变量渲染为空串，表达式错误退回默认排版并在通知里标注；模板在受限命名空间求值，__import__/open/__class__ 等写法被拒绝。",
       "v1.2.0": "新增图文同条：海报图片段与通知文本放进同一条消息（QQ 同一气泡），并可选图片在上/在下、或维持分开发送；新增「极简」排版样式（✅ 标题 + · 字段），配海报最协调；文本过长自动分段时自动退回分开发送。修复两处缺陷：群消息 @ 段取到布尔值导致 {\"qq\": \"True\"}；群目标前缀只认全角/只认半角冒号的问题（现在 群:/群：/group:/群聊： 均可）。",
       "v1.1.0": "新增卡片式排版（按显示宽度对齐中日韩与 emoji，字段自动分行、超长截断）；图片支持 URL / base64 内嵌 / 本地路径三种落地方式并按候选自动降级，修复图片发不出来的问题；新增正向 WebSocket 传输（可收到 message_sent 投递回执）与传输抽象层；新增 NapCat 扩展 API：合并转发 send_forward_msg（长通知折叠成卡片，失败自动降级）、表情回复 set_msg_emoji_like、能力探测；新增 /preview 与 /probe 接口及配置页自检按钮；补充 group_notice / upload_file / poke 封装。",
       "v1.0.0": "首个版本：订阅宿主通知事件并转发到 OneBot v11（NapCat）；支持私聊/群聊多目标、用户定向映射、消息类型过滤、海报与链接、群内 @、单条长度分段、队列限流、去重与失败重试；补充整理完成/失败结构化通知、远程命令与手动推送 API。"

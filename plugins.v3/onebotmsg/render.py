@@ -17,7 +17,6 @@
 
 import unicodedata
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-
 # 排版样式标识
 STYLE_CARD = "card"
 STYLE_MINIMAL = "minimal"
@@ -128,41 +127,14 @@ def wrap_text(text: str, width: int) -> List[str]:
 
 
 def split_fields(text: str) -> List[Tuple[str, str]]:
-    """把 MoviePilot 的通知正文拆成 ``(字段名, 值)`` 列表。
+    """把通知正文拆成 ``(字段名, 值)`` 列表。
 
-    与宿主通知的正文约定一致：形如 ``季集：S01E01``。解析策略：
-
-    * 逐行处理，行内既可能是一个字段，也可能是 ``a：1，b：2`` 这样的多字段；
-    * 字段名不能包含分隔符，因此 ``时间：2026-10-10 02:34:17`` 的值里保留冒号；
-    * 完全不含 ``标签：`` 的行按整行文本保留，不按逗号硬拆——否则
-      ``一句话通知，没有字段结构`` 会被错误地切成两行。
-
-    没有字段名结构的行按整体文本保留，避免正文被曲解。
+    实现只有一份，放在 :mod:`.content`（内容职责）；这里保留同名入口，
+    让调用方继续 ``from .render import split_fields`` 即可。
     """
-    import re
+    from .content import fields_from_lines
 
-    value = str(text or "").strip()
-    if not value:
-        return []
-    label_token = re.compile(r"(?:^|[，,;；])\s*([^：:，,;；]{1,16})[：:]")
-    fields: List[Tuple[str, str]] = []
-    for raw_line in value.split("\n"):
-        line = raw_line.strip()
-        if not line:
-            continue
-        if not label_token.search(line):
-            fields.append(("", line))
-            continue
-        pieces = [piece.strip()
-                  for piece in re.split(r"[，,;；]+", line)
-                  if piece.strip()]
-        for piece in pieces:
-            match = re.match(r"^([^：:]{1,16})[：:]\s*(.*)$", piece, re.DOTALL)
-            if match and match.group(1).strip():
-                fields.append((match.group(1).strip(), match.group(2).strip()))
-            else:
-                fields.append(("", piece))
-    return fields
+    return fields_from_lines(text)
 
 
 def build_card(emoji: str, title: str, text: Optional[str], link: Optional[str],
@@ -170,14 +142,29 @@ def build_card(emoji: str, title: str, text: Optional[str], link: Optional[str],
                max_width: int = DEFAULT_MAX_WIDTH,
                max_rows: int = DEFAULT_MAX_ROWS,
                value_width: int = DEFAULT_VALUE_WIDTH,
-               footer: Optional[str] = None) -> str:
-    """渲染一条通知文本。"""
+               footer: Optional[str] = None,
+               template: Optional[str] = None,
+               variables: Optional[Dict[str, Any]] = None) -> str:
+    """渲染一条通知文本。
+
+    ``template`` 非空时**完全接管正文**：模板的输出按原样使用（``raw`` 样式直出），
+    让用户自己决定字段与排版；模板为空时用上面的字段解析。模板出错会退回默认
+    正文，绝不因为模板写错就丢掉整条通知。
+    """
     style = normalize_style(style)
+    body = str(text or "").strip()
+    if template and str(template).strip():
+        from .template import render as render_template
+
+        rendered, error = render_template(str(template), variables or {})
+        if error is None:
+            return rendered.strip()
+        # 模板出错：正文退回默认解析结果，样式也退回默认，避免半成品排版。
+        body = f"{body}\n（模板渲染失败，已按默认内容发送）" if body else body
     heading = " ".join(part for part in (str(emoji or "").strip(),
                                          str(title or "").strip()) if part)
     if prefix:
         heading = f"{prefix} {heading}".strip()
-    body = str(text or "").strip()
     link_text = str(link or "").strip()
 
     if style == STYLE_PLAIN:

@@ -37,6 +37,15 @@ try:  # pragma: no cover - 兼容宿主未暴露该入口的早期 V3 版本
 except Exception:  # noqa: BLE001
     resolve_media_identity = None  # type: ignore[assignment]
 
+from .content import (
+    ContentStage,
+    MESSAGE_TYPE_STYLE,
+    describe_variables,
+    emoji_of,
+    fields_from_lines,
+    sample_stage,
+    type_title_of,
+)
 from .napcat import (
     IMAGE_LAYOUT_ATTACH,
     IMAGE_LAYOUT_LABELS,
@@ -89,18 +98,9 @@ from .transport import (
 )
 
 
-# 消息类型 -> 展示名与 emoji。键使用 MessageType 成员名，便于配置跨版本稳定。
-_MESSAGE_TYPE_STYLE: Dict[str, Tuple[str, str]] = {
-    "Download": ("资源下载", "📥"),
-    "Organize": ("整理入库", "✅"),
-    "Subscribe": ("订阅", "🔔"),
-    "SiteMessage": ("站点", "🌐"),
-    "MediaServer": ("媒体服务器", "🎬"),
-    "Manual": ("手动处理", "🛠️"),
-    "Plugin": ("插件", "🧩"),
-    "Agent": ("智能体", "🤖"),
-    "Other": ("其它", "📢"),
-}
+# 消息类型 -> 展示名与 emoji 的唯一定义在 content.py（内容职责），这里仅做别名，
+# 避免同一张表在插件里维护两份而逐渐不一致。
+_MESSAGE_TYPE_STYLE: Dict[str, Tuple[str, str]] = MESSAGE_TYPE_STYLE
 
 # 默认开启的消息类型（枚举成员名）。
 _DEFAULT_TYPES = ["Organize", "Download", "Subscribe", "Manual", "SiteMessage", "Plugin"]
@@ -125,6 +125,24 @@ SEND_MODE_LABELS = {
     SEND_MODE_FORWARD: "合并转发（NapCat 扩展，长通知更整洁）",
 }
 
+# 自定义模板的示例：既能直接抄，也说明了可用语法
+_TEMPLATE_EXAMPLE = (
+    "${emoji} ${title}\n"
+    "% for name, value in fields.items():\n"
+    "· ${name}：${value}\n"
+    "% endfor\n"
+    "% if link:\n"
+    "🔗 ${link}\n"
+    "% endif"
+)
+
+# 模板使用说明（放在表单 hint 里，避免用户翻文档）
+_TEMPLATE_HINT = (
+    "留空则按上面的排版样式自动渲染。填写后完全接管通知正文，可用语法："
+    "${变量}、${a or '兜底'}、% if 条件: … % endif、% for x in 列表: … % endfor。"
+    "点「查看模板变量」可以看到这条通知里有哪些变量可用。"
+)
+
 
 class PushResult(BaseModel):
     """手动推送接口的返回模型。"""
@@ -145,7 +163,7 @@ class OneBotMsg(_PluginBase):
     # 插件市场索引与插件类声明同一个字段，两者必须保持同一形式。
     plugin_icon = "https://raw.githubusercontent.com/NapNeko/NapCatQQ/main/logo.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "TANZZZ"
     # 作者主页
@@ -187,6 +205,10 @@ class OneBotMsg(_PluginBase):
     _send_mode: str = SEND_MODE_TEXT
     _forward_threshold: int = _FORWARD_HINT_ROWS
     _react_on_success: bool = False
+    # 内容模板与按类型的图标覆盖
+    _title_template: str = ""
+    _body_template: str = ""
+    _emoji_overrides: Dict[str, str] = None  # type: ignore[assignment]
     _max_length: int = _DEFAULT_MAX_LENGTH
     _card_width: int = DEFAULT_MAX_WIDTH
     _dedupe_seconds: int = 20
@@ -222,6 +244,7 @@ class OneBotMsg(_PluginBase):
         self._accepting = False
         self._last_message_id = None
         self._capabilities = {}
+        self._emoji_overrides = {}
         self._stats = {
             "received": 0,
             "sent": 0,
@@ -284,6 +307,9 @@ class OneBotMsg(_PluginBase):
         self._forward_threshold = _as_int(config.get("forward_threshold"),
                                           _FORWARD_HINT_ROWS)
         self._react_on_success = bool(config.get("react_on_success"))
+        self._title_template = str(config.get("title_template") or "")
+        self._body_template = str(config.get("body_template") or "")
+        self._emoji_overrides = parse_emoji_overrides(config.get("emoji_overrides"))
         self._max_length = _as_int(config.get("max_length"), _DEFAULT_MAX_LENGTH)
         self._card_width = _as_int(config.get("card_width"), DEFAULT_MAX_WIDTH)
         self._dedupe_seconds = _as_int(config.get("dedupe_seconds"), 20)
@@ -452,11 +478,15 @@ class OneBotMsg(_PluginBase):
             sent, detail = self._dispatch_forward(
                 transport, emoji=emoji, title=title, text=text, link=link,
                 user_ids=user_ids, group_ids=group_ids, at_user=at_user,
+                type_name=task.get("type_name"), event=task.get("event"),
             )
         else:
             sent, detail = self._dispatch_card(
                 transport, emoji=emoji, title=title, text=text, link=link,
                 image=image, user_ids=user_ids, group_ids=group_ids, at_user=at_user,
+                type_name=task.get("type_name"), event=task.get("event"),
+                userid=str(task["userid"]) if task.get("userid") else None,
+                username=str(task["username"]) if task.get("username") else None,
             )
 
         if sent:
@@ -488,25 +518,51 @@ class OneBotMsg(_PluginBase):
                        text: Optional[str], link: Optional[str],
                        image: Optional[str], user_ids: List[str],
                        group_ids: List[str], at_user: Optional[str],
-                       allow_image_fallback: bool = True) -> Tuple[bool, str]:
+                       allow_image_fallback: bool = True,
+                       type_name: Optional[str] = None,
+                       event: Optional[Dict[str, Any]] = None,
+                       userid: Optional[str] = None,
+                       username: Optional[str] = None) -> Tuple[bool, str]:
         """按卡片样式发送：文本 + 可选图片 + 可选链接。
+
+        内容先经 :class:`~.content.ContentStage` 组织：按类型套用图标/标题覆盖，
+        再按用户模板（若配置）渲染正文，最后交给排版层决定外观。
 
         图片有两种呈现方式（配置 ``image_layout``）：
 
         * ``attach``（默认）：图片段与文本段**放进同一条消息**，QQ 会把它们显示在
           同一个气泡里，海报就成了通知的一部分，比「先一条文字、再一条图片」紧凑得多；
-        * ``separate``：先发文本、再单独发图片（1.1.0 的行为）。
+        * ``separate``：先发文本、再单独发图片。
 
         inline 失败时自动退回 separate，保证图片和文字都不会丢。
         """
+        stage = ContentStage(
+            title=title or "MoviePilot 通知",
+            type_name=type_name,
+            fields=fields_from_lines(text),
+            raw_text=str(text or ""),
+            image=image,
+            link=link,
+            userid=userid,
+            username=username,
+            event=event or {},
+        )
+        emoji = self._resolve_emoji(stage, emoji)
+        stage.title = self._resolve_title(stage)
+        variables = stage.template_variables({"targets": {
+            "users": user_ids, "groups": group_ids,
+        }})
+
         card = build_card(
             emoji=emoji,
-            title=title,
-            text=text,
+            title=stage.title,
+            text=stage.body(),
             link=link if self._send_link else None,
-            style=self._style,
+            style=STYLE_PLAIN if self._body_template.strip() else self._style,
             prefix=self._title_prefix,
             max_width=self._card_width,
+            template=self._body_template or None,
+            variables=variables,
         )
         chunks = _split_text(card, self._max_length)
 
@@ -558,6 +614,26 @@ class OneBotMsg(_PluginBase):
         elif image_note:
             detail_parts.append(image_note)
         return True, "；".join(detail_parts)
+
+    def _resolve_emoji(self, stage: ContentStage, fallback: str = "") -> str:
+        """决定本条通知的图标：按类型的自定义覆盖 > 调用方指定 > 类型默认。"""
+        overrides = self._emoji_overrides or {}
+        if stage.type_name and stage.type_name in overrides:
+            return overrides[stage.type_name]
+        if fallback:
+            return fallback
+        return stage.emoji
+
+    def _resolve_title(self, stage: ContentStage) -> str:
+        """决定本条通知的标题：配了标题模板就用模板渲染。"""
+        template = str(self._title_template or "").strip()
+        if not template:
+            return stage.title
+        rendered, error = stage.apply_template(template)
+        if error:
+            logger.debug(f"标题模板渲染失败，使用默认标题：{error}")
+            return stage.title
+        return rendered.strip() or stage.title
 
     def _image_candidates(self, image: str) -> Tuple[List[str], str]:
         """把图片来源解析为按优先级排序的候选发送值。"""
@@ -747,13 +823,25 @@ class OneBotMsg(_PluginBase):
     def _dispatch_forward(self, transport: Transport, *, emoji: str, title: str,
                           text: Optional[str], link: Optional[str],
                           user_ids: List[str], group_ids: List[str],
-                          at_user: Optional[str]) -> Tuple[bool, str]:
+                          at_user: Optional[str],
+                          type_name: Optional[str] = None,
+                          event: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
         """以合并转发形式发送（NapCat 扩展动作）。
 
         该动作需要 NapCat 支持；若返回失败，自动降级为卡片文本，保证通知不断。
         """
+        stage = ContentStage(
+            title=title or "MoviePilot 通知",
+            type_name=type_name,
+            fields=fields_from_lines(text),
+            raw_text=str(text or ""),
+            link=link,
+            event=event or {},
+        )
+        emoji = self._resolve_emoji(stage, emoji)
+        stage.title = self._resolve_title(stage)
         nodes = build_forward_nodes(
-            emoji=emoji, title=title, text=text,
+            emoji=emoji, title=stage.title, text=stage.body(),
             link=link if self._send_link else None,
             bot_name=self.plugin_name, bot_uin="10000",
         )
@@ -781,8 +869,9 @@ class OneBotMsg(_PluginBase):
             return True, f"合并转发 {ok_count} 个目标"
         logger.debug(f"合并转发失败，降级为卡片文本：{results[:2]}")
         sent, detail = self._dispatch_card(
-            transport, emoji=emoji, title=title, text=text, link=link,
+            transport, emoji=emoji, title=stage.title, text=text, link=link,
             image=None, user_ids=user_ids, group_ids=group_ids, at_user=at_user,
+            type_name=type_name, event=event,
         )
         return sent, f"合并转发不可用，已降级：{detail}"
 
@@ -846,6 +935,8 @@ class OneBotMsg(_PluginBase):
             emoji=_type_emoji(type_name),
             image=str(data.get("image")) if data.get("image") else None,
             link=str(data.get("link")) if data.get("link") else None,
+            type_name=type_name,
+            event=data,
             userid=data.get("userid"),
             username=data.get("username"),
             targets=data.get("targets"),
@@ -943,6 +1034,8 @@ class OneBotMsg(_PluginBase):
             text="\n".join(lines),
             emoji=emoji,
             link=str(info.get("link") or "") or None,
+            type_name="Organize",
+            event=data,
             image=_first_value(info, "image", "poster", "backdrop")
             or str(media.get("poster_path") or media.get("backdrop_path") or "") or None,
         ))
@@ -1004,13 +1097,15 @@ class OneBotMsg(_PluginBase):
     def _task(self, *, title: str, text: Optional[str] = None, emoji: str = "",
               link: Optional[str] = None, image: Optional[str] = None,
               send_mode: Optional[str] = None,
+              type_name: Optional[str] = None,
+              event: Optional[Dict[str, Any]] = None,
               userid: Optional[Union[str, int]] = None,
               username: Optional[Union[str, int]] = None,
               targets: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """构造一条待发送任务。
 
-        任务只保存原始素材（标题/正文/图片/链接），真正的排版在发送时按当前配置
-        完成：这样改排版样式或图片方式不需要重新入队，也让两种传输共用同一份渲染。
+        任务只保存原始素材（标题/正文/图片/链接）与事件数据，真正的排版在发送时按
+        当前配置完成：这样改模板或图片方式不需要重新入队，也让两种传输共用同一份渲染。
         """
         return {
             "title": str(title or "MoviePilot 通知"),
@@ -1019,6 +1114,8 @@ class OneBotMsg(_PluginBase):
             "link": str(link) if link else None,
             "image": str(image) if image else None,
             "send_mode": send_mode,
+            "type_name": type_name,
+            "event": dict(event or {}),
             "userid": userid,
             "username": username,
             "targets": targets,
@@ -1236,6 +1333,14 @@ class OneBotMsg(_PluginBase):
                 "methods": ["GET"],
                 "auth": "bear",
                 "summary": "探测 NapCat 版本与图片发送能力",
+                "response_model": PushResult,
+            },
+            {
+                "path": "/variables",
+                "endpoint": self.list_template_variables,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "列出模板可用变量，并渲染当前模板",
                 "response_model": PushResult,
             },
         ]
@@ -1548,6 +1653,19 @@ class OneBotMsg(_PluginBase):
                     self._field("retries", "失败重试次数", placeholder="2",
                                 field_type="number", md=4),
                 ),
+                self._section(
+                    "内容模板（进阶）", "留空即用上面的排版；填了则完全接管通知内容",
+                    self._field("body_template", "正文模板", kind="VTextarea", rows=6,
+                                md=12, placeholder=_TEMPLATE_EXAMPLE,
+                                hint=_TEMPLATE_HINT),
+                    self._field("title_template", "标题模板", md=12,
+                                placeholder="${emoji} ${title}",
+                                hint="留空则用「图标 + 宿主标题」；同样支持变量与条件"),
+                    self._field("emoji_overrides", "按类型自定义图标",
+                                kind="VTextarea", rows=3, md=12,
+                                placeholder="Organize=🎬\nDownload=📦\nSubscribe=🔔",
+                                hint="每行一个「类型=图标」；类型可写 Organize 或 整理入库"),
+                ),
                 {
                     "component": "VRow",
                     "content": [
@@ -1592,6 +1710,28 @@ class OneBotMsg(_PluginBase):
                                         ),
                                     },
                                     "text": "预览排版效果",
+                                }
+                            ],
+                        },
+                        {
+                            "component": "VCol",
+                            "props": {"cols": 12, "md": 4},
+                            "content": [
+                                {
+                                    "component": "VBtn",
+                                    "props": {
+                                        "color": "teal",
+                                        "variant": "tonal",
+                                        "prepend-icon": "mdi-variable",
+                                        "onclick": (
+                                            "function(e) { window.MoviePilotAPI.get("
+                                            "'plugin/OneBotMsg/variables').then(function(r) {"
+                                            " alert((r && r.message) || '无变量') })"
+                                            ".catch(function(err) { console.error(err);"
+                                            " alert('读取变量失败') }) }"
+                                        ),
+                                    },
+                                    "text": "查看模板变量",
                                 }
                             ],
                         },
@@ -1666,6 +1806,9 @@ class OneBotMsg(_PluginBase):
             "send_link": True,
             "at_in_group": False,
             "react_on_success": False,
+            "title_template": "",
+            "body_template": "",
+            "emoji_overrides": "",
             "max_length": _DEFAULT_MAX_LENGTH,
             "dedupe_seconds": 20,
             "rate_limit": 3,
@@ -1737,6 +1880,29 @@ class OneBotMsg(_PluginBase):
             lines.append("提示：未能取到版本信息，通常是地址/Token 不正确，或服务未启动。")
         elif report.get("can_send_image") is False:
             lines.append("提示：NapCat 报告当前账号不能发送图片，图片会被跳过。")
+        return PushResult(success=True, message="\n".join(lines), targets=0)
+
+    def list_template_variables(self, payload: Optional[dict] = None) -> PushResult:
+        """列出模板可用变量，并用当前模板渲染一条示例。
+
+        用户不用猜变量名，也不用真发一条通知去试错：改完模板点一下就能看到结果。
+        """
+        stage = sample_stage()
+        stage.title = self._resolve_title(stage)
+        lines = [
+            f"示例通知：{self._resolve_emoji(stage)} {stage.title}",
+            "",
+            "可用变量（示例值）：",
+            describe_variables(stage, limit=60),
+        ]
+        if self._body_template.strip():
+            rendered, error = stage.apply_template(self._body_template)
+            lines += ["", "当前正文模板渲染结果：", rendered]
+            if error:
+                lines.append(f"（渲染失败，已退回默认内容：{error}）")
+        else:
+            lines += ["", "当前未配置正文模板，将按上面的排版样式自动渲染。",
+                      f"可直接抄的示例：\n{_TEMPLATE_EXAMPLE}"]
         return PushResult(success=True, message="\n".join(lines), targets=0)
 
     def get_page(self) -> Optional[List[dict]]:
@@ -1914,6 +2080,70 @@ def _as_choice(value: Any, allowed: Dict[str, Any], default: str) -> str:
     return text if text in allowed else default
 
 
+def parse_emoji_overrides(value: Any) -> Dict[str, str]:
+    """解析「按类型自定义图标」配置。
+
+    支持三种写法，都是为了让用户不必记住 JSON：
+
+    * 行式：``Organize=🎬``
+    * JSON：``{"Organize": "🎬"}``
+    * 逗号分隔：``Organize=🎬,Download=📦``
+
+    键既接受 ``MessageType`` 成员名（``Organize``），也接受展示名（``整理入库``）。
+    """
+    if not value:
+        return {}
+    text = str(value).strip()
+    if not text:
+        return {}
+    mapping: Dict[str, str] = {}
+    if text.startswith("{"):
+        try:
+            import json
+
+            loaded = json.loads(text)
+            if isinstance(loaded, dict):
+                for key, item in loaded.items():
+                    name = _canonical_type_name(str(key))
+                    icon = str(item or "").strip()
+                    if name and icon:
+                        mapping[name] = icon
+                return mapping
+        except (ValueError, TypeError):
+            # JSON 解析失败时继续按行式解析，不让配置错误变成"没有图标"。
+            pass
+    for chunk in text.replace("\r", "\n").replace("，", ",").replace("；", ";") \
+            .replace(";", "\n").replace(",", "\n").split("\n"):
+        line = chunk.strip()
+        if not line:
+            continue
+        separator = "=" if "=" in line else (":" if ":" in line else None)
+        if not separator:
+            continue
+        raw_name, _, raw_icon = line.partition(separator)
+        name = _canonical_type_name(raw_name.strip().strip('"').strip("'"))
+        icon = raw_icon.strip().strip('"').strip("'")
+        if name and icon:
+            mapping[name] = icon
+    return mapping
+
+
+def _canonical_type_name(value: str) -> Optional[str]:
+    """把用户写的类型标识规范化为 MessageType 成员名。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text in MESSAGE_TYPE_STYLE:
+        return text
+    for name, (label, _icon) in MESSAGE_TYPE_STYLE.items():
+        if text == label:
+            return name
+    for member in MessageType:
+        if text.lower() == member.name.lower() or text == member.value:
+            return member.name
+    return text
+
+
 def _type_name(mtype: Any) -> Optional[str]:
     """从通知类型字段解析出稳定的枚举成员名。"""
     if mtype is None:
@@ -1937,9 +2167,7 @@ def _type_name(mtype: Any) -> Optional[str]:
 
 def _type_emoji(type_name: Optional[str]) -> str:
     """返回消息类型对应的 emoji。"""
-    if not type_name:
-        return "📢"
-    return _MESSAGE_TYPE_STYLE.get(type_name, ("", "📢"))[1]
+    return emoji_of(type_name)
 
 
 def _dedupe_key(type_name: Optional[str], title: str, text: str,

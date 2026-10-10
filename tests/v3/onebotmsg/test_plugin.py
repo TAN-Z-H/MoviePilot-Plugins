@@ -483,8 +483,8 @@ def checks_plugin_metadata() -> None:
     check((plugin_file.parent / "README.md").is_file(), "插件目录包含 README.md")
     check(plugin.__name__ == PLUGIN_NAMESPACE, "按生产命名空间 app.plugins.onebotmsg 加载")
     check(plugin.OneBotMsg.plugin_config_prefix == f"{PLUGIN_ID}_", "配置前缀匹配插件 ID")
-    check(plugin.OneBotMsg.plugin_version == "1.2.0",
-          f"版本为 1.2.0（实际 {plugin.OneBotMsg.plugin_version}）")
+    check(plugin.OneBotMsg.plugin_version == "1.3.0",
+          f"版本为 1.3.0（实际 {plugin.OneBotMsg.plugin_version}）")
     for name in ("onebot", "transport", "ws", "render", "napcat"):
         check((plugin_file.parent / f"{name}.py").is_file(), f"子模块 {name}.py 存在")
     check("命名空间导入" in _HOST_KIND or "内置文件加载" in _HOST_KIND,
@@ -625,6 +625,214 @@ def checks_transport_layer() -> None:
         ws_transport.close()
     finally:
         server.stop()
+
+
+def _rendered(result: str) -> str:
+    """把模板渲染结果规范化：去掉编译期补齐的行尾换行，并去掉首尾空白。"""
+    return str(result or "").strip()
+
+
+def checks_template_engine() -> None:
+    """模板引擎：变量、兜底、条件、循环与安全性。"""
+    template = sub("template")
+    group("5. 内容模板引擎")
+
+    check(_rendered(template.render("${title}", {"title": "入库"})[0]) == "入库",
+          "变量替换")
+    check(_rendered(template.render("${media.tmdb_id}",
+                                    {"media": {"tmdb_id": "123"}})[0]) == "123",
+          "点号取嵌套变量")
+    check(_rendered(template.render("${note[0]}", {"note": ["a", "b"]})[0]) == "a",
+          "下标取列表元素")
+    check(_rendered(template.render("${missing}", {})[0]) == "",
+          "缺失变量渲染为空串")
+    check(_rendered(template.render("${media.nope}", {"media": {}})[0]) == "",
+          "嵌套字段缺失也渲染为空串")
+    check(_rendered(template.render("${year or '未知'}", {"year": ""})[0]) == "未知",
+          "or 兜底")
+    check(_rendered(template.render("${year or '未知'}", {"year": "2024"})[0]) == "2024",
+          "or 有值时取原值")
+    check(_rendered(template.render("${size(1536)}", {})[0]) == "1.50 KB",
+          "size 辅助函数")
+    check(_rendered(template.render("${shorten('abcdefgh', 5)}", {})[0]) == "abcd…",
+          "shorten 辅助函数")
+    check(_rendered(template.render("${fmt_time(0, '%Y')}", {})[0]).isdigit(),
+          "fmt_time 接受时间戳")
+
+    conditional = "% if season:\n季集：${season}\n% else:\n无季集信息\n% endif"
+    check(_rendered(template.render(conditional, {"season": "S01"})[0]) == "季集：S01",
+          "if 分支")
+    check(_rendered(template.render(conditional, {"season": ""})[0]) == "无季集信息",
+          "else 分支")
+    check(_rendered(template.render("% if a:\nA\n% elif b:\nB\n% endif",
+                                    {"a": 0, "b": 1})[0]) == "B", "elif 分支")
+
+    loop = "% for name, value in fields.items():\n${name}=${value}\n% endfor"
+    rendered = _rendered(template.render(loop, {"fields": {"a": "1", "b": "2"}})[0])
+    check("a=1" in rendered and "b=2" in rendered, "for 循环遍历字典")
+
+    simple_loop = "% for item in files:\n- ${item}\n% endfor"
+    check(_rendered(template.render(simple_loop,
+                                    {"files": ["x.mkv", "y.srt"]})[0]).count("-") == 2,
+          "for 循环遍历列表")
+
+    mixed = "${emoji} ${title}\n% for item in lines:\n· ${item}\n% endfor"
+    check(_rendered(template.render(mixed, {"emoji": "✅", "title": "T",
+                                            "lines": ["a"]})[0]) == "✅ T\n· a",
+          "变量与循环混排（换行保留）")
+
+    # 安全性：越权访问必须被拒绝，且退回原文而不是抛异常
+    for evil in ("${().__class__.__name__}", "${open('/etc/passwd')}",
+                 "${__import__('os').system('id')}", "${globals()}",
+                 "${title.__class__.__bases__}"):
+        result, error = template.render(evil, {"title": "x"})
+        check(error is not None and result == evil,
+              f"拒绝不安全表达式：{evil[:32]}")
+
+    result, error = template.render("${1/0}", {})
+    check(error is not None and result == "${1/0}", "求值异常时退回原文并给出原因")
+
+    # 缺 endif 不报错（按已解析内容收尾），保证通知仍能发出
+    result, error = template.render("% if x:\n内容", {"x": 1})
+    check(error is None and "内容" in result, "缺 endif 时容错收尾")
+
+    check(template.render("", {"a": 1})[0] == "", "空模板返回空串")
+    check(_rendered(template.render("纯文本无变量", {})[0]) == "纯文本无变量",
+          "无变量时原样返回")
+
+    flat = template.flatten_variables({"a": {"b": {"c": 1}}, "d": 2})
+    check(flat == {"a.b.c": 1, "d": 2}, f"变量摊平 -> {flat}")
+
+
+def checks_content_stage() -> None:
+    """内容组织：字段解析、模板变量与标题/图标覆盖。"""
+    content = sub("content")
+    group("6. 内容组织与覆盖")
+
+    fields = content.fields_from_lines("季集：S01E03\n分类：日番")
+    check(fields == [("季集", "S01E03"), ("分类", "日番")], f"字段解析 -> {fields}")
+    check(content.fields_from_lines("一句话通知，没有字段结构")
+          == [("", "一句话通知，没有字段结构")], "无字段结构时整行保留")
+
+    stage = content.ContentStage(
+        title="入库 某剧", type_name="Organize",
+        fields=[("季集", "S01E03")], raw_text="季集：S01E03",
+        event={"media": {"title": "某剧", "tmdb_id": "1"}},
+    )
+    variables = stage.template_variables()
+    check(variables["title"] == "入库 某剧", "title 变量")
+    check(variables["media.tmdb_id"] == "1", "事件数据摊平后可用")
+    check(variables["季集"] == "S01E03", "字段名可直接作为变量")
+    check(variables["type_name"] == "整理入库", "类型展示名变量")
+    check(variables["emoji"] == "✅", "类型图标变量")
+    check("now" in variables and "date" in variables, "时间变量")
+
+    check(content.emoji_of("Organize") == "✅", "图标映射")
+    check(content.emoji_of(None) == "📢", "未知类型回落默认图标")
+    check(content.type_title_of("Download") == "资源下载", "类型展示名映射")
+
+
+def checks_content_overrides() -> None:
+    """插件侧的标题模板、正文模板与按类型图标覆盖。"""
+    plugin = host()
+    group("7. 模板与覆盖在发送路径上生效")
+
+    # 按类型自定义图标（行式配置）
+    instance, calls, stack = _new_instance({
+        **CONFIG_SINGLE, "emoji_overrides": "Organize=🎬\nDownload=📦",
+    })
+    try:
+        instance._enqueue_task(instance._task(
+            title="入库 某剧", text="季集：S01E03", type_name="Organize",
+        ))
+        instance._queue.join()
+        text = _texts(calls)[0]
+        check("🎬" in text and "✅" not in text,
+              f"图标被覆盖 -> {text.splitlines()[1][:20]!r}")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    # 中文类型名也能配置
+    instance, calls, stack = _new_instance({
+        **CONFIG_SINGLE, "emoji_overrides": "整理入库=🌟",
+    })
+    try:
+        instance._enqueue_task(instance._task(
+            title="入库 某剧", text="季集：S01E03", type_name="Organize",
+        ))
+        instance._queue.join()
+        check("🌟" in _texts(calls)[0], "中文类型名同样生效")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    # JSON 写法的图标覆盖
+    overrides = plugin.parse_emoji_overrides('{"Organize": "🎯"}')
+    check(overrides.get("Organize") == "🎯", "JSON 写法解析")
+    check(plugin.parse_emoji_overrides("Organize=🎯,Download=📦").get("Download") == "📦",
+          "逗号分隔写法解析")
+    check(plugin.parse_emoji_overrides("") == {}, "空配置返回空表")
+    check(plugin.parse_emoji_overrides("乱写没有等号") == {}, "非法配置返回空表")
+
+    # 正文模板接管排版（raw 直出，不再加边框）
+    instance, calls, stack = _new_instance({
+        **CONFIG_SINGLE,
+        "body_template": "${emoji} ${title}\n% for name, value in fields.items():\n"
+                         "→ ${name}：${value}\n% endfor",
+    })
+    try:
+        instance._enqueue_task(instance._task(
+            title="入库 某剧", text="季集：S01E03\n分类：日番", emoji="✅",
+            type_name="Organize",
+        ))
+        instance._queue.join()
+        text = _texts(calls)[0]
+        check("╭" not in text, f"模板接管后不再套边框 -> {text[:20]!r}")
+        check("→ 季集：S01E03" in text, "模板循环渲染字段")
+        check(text.startswith("✅ 入库 某剧"), f"模板含标题 -> {text[:20]!r}")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    # 标题模板
+    instance, calls, stack = _new_instance({**CONFIG_SINGLE,
+                                            "title_template": "【MP】${type_name} - ${title}"})
+    try:
+        instance._enqueue_task(instance._task(
+            title="某剧", text="季集：S01E03", type_name="Organize",
+        ))
+        instance._queue.join()
+        check("【MP】整理入库 - 某剧" in _texts(calls)[0], "标题模板生效")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    # 模板写错时退回默认内容，通知照常发出
+    instance, calls, stack = _new_instance({**CONFIG_SINGLE,
+                                            "body_template": "${1/0}"})
+    try:
+        instance._enqueue_task(instance._task(title="入库", text="季集：S01E03"))
+        instance._queue.join()
+        check(bool(calls), "模板出错仍会发送")
+        text = _texts(calls)[0]
+        check("季集：S01E03" in text, f"退回默认内容 -> {text[:40]!r}")
+        check("模板渲染失败" in text, "通知里说明模板失败")
+    finally:
+        stack.stop()
+        instance.stop_service()
+
+    # 变量清单接口
+    instance = host().OneBotMsg()
+    with mock.patch("urllib.request.urlopen", fake_urlopen_factory([])):
+        instance.init_plugin(CONFIG)
+    try:
+        result = instance.list_template_variables()
+        check(result.success and "可用变量" in result.message, "变量清单接口可用")
+        check("media.media_id" in result.message, "清单包含事件摊平后的变量")
+        check("示例" in result.message, "清单包含示例通知")
+    finally:
+        instance.stop_service()
 
 
 def checks_render_layout() -> None:
@@ -1334,6 +1542,7 @@ def checks_form_contract() -> None:
             "forward_threshold", "max_length", "send_link", "at_in_group",
             "react_on_success", "send_image", "image_mode", "image_layout",
             "image_position", "max_image_mb",
+            "title_template", "body_template", "emoji_overrides",
             "msgtypes", "dedupe_seconds", "rate_limit", "retries",
         )
         missing_form = [f for f in expected_fields if f'"model": "{f}"' not in rendered]
@@ -1364,6 +1573,9 @@ ALL_CHECKS: Tuple[Callable[[], None], ...] = (
     checks_ws_framing,
     checks_ws_roundtrip,
     checks_transport_layer,
+    checks_template_engine,
+    checks_content_stage,
+    checks_content_overrides,
     checks_render_layout,
     checks_image_handling,
     checks_transport_in_plugin,
